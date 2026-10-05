@@ -49,6 +49,8 @@ static int cx4_dma_write_lo = -1, cx4_dma_write_hi = -1;
 static int cx4_dma_read_lo = -1, cx4_dma_read_hi = -1;
 static volatile uint cx4_active_write_buf = 0;
 static volatile uint cx4_active_read_buf = 0;
+static uint32_t cx4_pio_write_scan_pos[2] = {0, 0};
+static uint64_t cx4_pio_write_scan_total = 0;
 #define SNAP_MAX_RANGES 256u
 #define SNAP_MAX_BYTES  4096u
 
@@ -300,6 +302,27 @@ static uint32_t cx4_dma_pair_captured(int dma_a, int dma_b) {
     uint32_t ca = (ra <= SAMPLE_COUNT) ? (SAMPLE_COUNT - ra) : 0;
     uint32_t cb = (rb <= SAMPLE_COUNT) ? (SAMPLE_COUNT - rb) : 0;
     return ca < cb ? ca : cb;
+}
+
+/* Incrementally consume only the prefix for which BOTH write DMAs have
+ * completed a sample. This reuses the proven PIO falling-edge capture as the
+ * authoritative CX4 write stream without waiting for a full 1024-sample batch. */
+static void cx4_feed_pio_write_prefix(uint buf) {
+    if (buf > 1u || cx4_dma_write_lo < 0 || cx4_dma_write_hi < 0) return;
+    uint32_t count = cx4_dma_pair_captured(cx4_dma_write_lo, cx4_dma_write_hi);
+    if (count > SAMPLE_COUNT) count = SAMPLE_COUNT;
+    uint32_t pos = cx4_pio_write_scan_pos[buf];
+    if (count < pos) pos = 0; /* freshly re-armed buffer */
+    __asm volatile("dmb sy" ::: "memory");
+    for (uint32_t i = pos; i < count; ++i) {
+        uint32_t low18 = unpack_low18(low_samples[buf][i]);
+        uint32_t high20 = unpack_high20(high_samples[buf][i]);
+        uint8_t data = reconstruct_data(low18);
+        uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
+        cx4bus_pio_write(address, data);
+        cx4_pio_write_scan_total++;
+    }
+    cx4_pio_write_scan_pos[buf] = count;
 }
 
 typedef struct {
@@ -1224,7 +1247,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + CX4 BUS v0.3.7 LLE STREAMING + DEEP QUEUE ===\n");
+    printf("\n=== SNES RP2350B RA + CX4 BUS v0.3.8 LLE PIO-WRITE AUTHORITY ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
@@ -1347,6 +1370,8 @@ int main(void) {
     cx4_dma_read_hi = dma_read_hi;
     cx4_active_write_buf = 0;
     cx4_active_read_buf = 0;
+    cx4_pio_write_scan_pos[0] = cx4_pio_write_scan_pos[1] = 0;
+    cx4_pio_write_scan_total = 0;
 
     dma_channel_config dc_read_lo = dma_channel_get_default_config(dma_read_lo);
     channel_config_set_transfer_data_size(&dc_read_lo, DMA_SIZE_32);
@@ -1360,7 +1385,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.3.7 STREAMING + DEEP QUEUE available; drive starts OFF.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.3.8 PIO-WRITE AUTHORITY available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
@@ -1407,7 +1432,9 @@ int main(void) {
     uint read_buf = 0;
 
     while (true) {
-        // CX4 gets first priority on core0; never let RA batch decoding starve the coprocessor queue.
+        // v0.3.8: PIO+DMA is authoritative for CX4 writes. Feed every newly
+        // completed address/data pair before advancing the LLE core.
+        cx4_feed_pio_write_prefix(write_buf);
         cx4bus_service();
 
         // v1.6: when a pair fills, switch DMA to the other buffer immediately.
@@ -1418,6 +1445,9 @@ int main(void) {
             uint done = write_buf;
             uint next = done ^ 1u;
 
+            // Consume the tail that may have arrived since the loop-top scan.
+            cx4_feed_pio_write_prefix(done);
+
             // Rearm first. Do not stop/restart/clear the PIO state machines.
             dma_channel_set_write_addr(dma_lo, low_samples[next], false);
             dma_channel_set_trans_count(dma_lo, SAMPLE_COUNT, false);
@@ -1426,6 +1456,7 @@ int main(void) {
             dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
             write_buf = next;
             cx4_active_write_buf = next;
+            cx4_pio_write_scan_pos[next] = 0;
 
             // Service CX4 before/after the comparatively heavy RA mirror decode.
             cx4bus_service();

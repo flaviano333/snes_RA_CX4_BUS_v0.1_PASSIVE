@@ -10,17 +10,18 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3.7 LLE STREAMING + DEEP QUEUE
+ * CX4 BUS v0.3.8 LLE PIO-WRITE AUTHORITY
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
  * RetroPortingToolKit/snesrecomp CX4 implementation; it is not redistributed
  * in this package. The user's own game ROM is injected locally into a reserved flash slot after build.
  *
- * v0.3 deliberately runs the DSP in TURBO-to-idle mode after CPU writes that
- * can start work. This removes real-time scheduling from the first hardware
- * validation: the goal is functional correctness (self-test/sprites) before
- * reproducing exact 20 MHz busy timing.
+ * v0.3.8 keeps the active READ responder on core1, but makes the proven
+ * PIO+DMA write capture authoritative for all CX4 writes. Core1 may still
+ * create immediate CPU-visible shadow/status changes so back-to-back write/read
+ * tests remain responsive; the LLE core itself receives only PIO/DMA-captured
+ * bytes sampled at PHI2 falling edge.
  */
 
 #define PIN_PHI2       0u
@@ -77,7 +78,7 @@ static void cx4_rom_slot_probe(void) {
 }
 
 static Cx4 *s_core = NULL;
-/* Fast CPU-visible interface. Core1 NEVER calls cx4_read/cx4_write in v0.3.7.
+/* Fast CPU-visible interface. Core1 NEVER calls cx4_read/cx4_write in v0.3.8.
  * Core0 is the sole owner of the HG51B control/register state; core1 serves
  * the physical SNES bus from this shadow plus the core dataRAM byte array. */
 static uint8_t *s_dram = NULL;
@@ -86,7 +87,7 @@ static volatile uint8_t s_io_shadow[0x400];
 typedef struct { uint16_t off; uint16_t epoch; uint8_t data; uint8_t status_evt; } cx4_io_write_evt_t;
 #define CX4_IOQ_N 8192u
 /* Deep SPSC queue: the SNES is allowed to touch CX4 interface registers while
- * cache/DMA/DSP work is still in flight. v0.3.7 blocked core0 until a job became
+ * cache/DMA/DSP work is still in flight. v0.3.8 blocked core0 until a job became
  * idle and the old 512-entry queue overflowed, losing the very PB/PC/base writes
  * needed by subsequent runs. */
 static volatile cx4_io_write_evt_t s_ioq[CX4_IOQ_N];
@@ -129,6 +130,10 @@ static volatile uint64_t s_stream_slices = 0;
 static volatile uint64_t s_stream_master = 0;
 static volatile uint64_t s_idle_transitions = 0;
 static volatile uint32_t s_ioq_highwater = 0;
+static volatile uint64_t s_pio_writes = 0;
+static volatile uint64_t s_pio_dram_writes = 0;
+static volatile uint64_t s_pio_io_writes = 0;
+static volatile uint64_t s_sio_shadow_writes = 0;
 static volatile uint64_t s_reset_vectors = 0;
 static volatile uint64_t s_state_resets = 0;
 static volatile uint32_t s_last_read_addr = 0;
@@ -426,6 +431,8 @@ void cx4bus_init(void) {
     memset((void *)s_io_shadow, 0, sizeof(s_io_shadow));
     s_ioq_head = s_ioq_tail = 0;
     s_ioq_dropped = 0;
+    s_pio_writes = s_pio_dram_writes = s_pio_io_writes = 0;
+    s_sio_shadow_writes = 0;
     if (s_core) publish_io_shadow_core0();
 
     s_master_clock = 1;
@@ -466,7 +473,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
          * PIO capture path. */
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
-        /* Reset is also core0-owned in v0.3.7. Core1 only raises the request. */
+        /* Reset is also core0-owned in v0.3.8. Core1 only raises the request. */
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
         __asm volatile("nop; nop;" ::: "memory");
 
@@ -479,7 +486,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             if (raw_is_cx4(lo, hi)) {
                 uint16_t off = raw_cx4_offset(lo, hi);
 
-                /* v0.3.7: ZERO Cx4-core calls on core1. DRAM is a direct byte
+                /* v0.3.8: ZERO Cx4-core calls on core1. DRAM is a direct byte
                  * lookup; IO comes from a core0-published shadow. This removes
                  * the dual-core race and cuts physical read latency sharply. */
                 uint8_t v = 0u;
@@ -529,15 +536,19 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
             if (off_is_io(off)) {
+                /* Fast speculative CPU-visible echo only. The LLE core is NOT
+                 * fed from this SIO sample; PIO+DMA at PHI2 falling edge is
+                 * authoritative in v0.3.8. */
                 io_shadow_cpu_write(off, v);
-                const bool status_evt = write_changes_status(off);
                 status_on_cpu_write(off, v);
-                const uint16_t epoch = status_evt ? status_override_epoch() : 0u;
-                ioq_push(off, v, epoch, status_evt);
+                s_sio_shadow_writes++;
                 s_io_writes++;
             } else {
+                /* Same idea for DRAM: give immediate read-after-write behaviour,
+                 * then let the PIO path overwrite with the authoritative byte. */
                 uint32_t di = (uint32_t)(off & 0x0fffu);
                 if (s_dram && di < 0x0c00u) s_dram[di] = v;
+                s_sio_shadow_writes++;
                 s_dram_writes++;
             }
             s_cpu_writes++;
@@ -551,8 +562,39 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
     }
 }
 
+/* Feed one write captured by the proven PIO+DMA path. This function runs on
+ * core0 and is the ONLY producer of LLE write events in v0.3.8. */
+void cx4bus_pio_write(uint32_t address, uint8_t data) {
+    uint8_t bank = (uint8_t)(address >> 16);
+    uint16_t off = (uint16_t)address;
+    if (!(bank <= 0x3fu || (bank >= 0x80u && bank <= 0xbfu))) return;
+    if (off < 0x6000u || off > 0x7fffu) return;
+
+    /* CX4 exposes 3 KiB DRAM at $6000-$6BFF and mirror at $7000-$7BFF. */
+    if ((off >= 0x6000u && off <= 0x6bffu) ||
+        (off >= 0x7000u && off <= 0x7bffu)) {
+        uint32_t di = (uint32_t)(off & 0x0fffu);
+        if (di < 0x0c00u && s_dram) s_dram[di] = data;
+        s_pio_writes++;
+        s_pio_dram_writes++;
+        return;
+    }
+
+    /* IO is mirrored through $6C00-$6FFF / $7C00-$7FFF. */
+    if (!off_is_io(off)) return;
+
+    io_shadow_cpu_write(off, data);
+    const bool status_evt = write_changes_status(off);
+    if (status_evt) status_on_cpu_write(off, data);
+    const uint16_t epoch = status_evt ? status_override_epoch() : 0u;
+    ioq_push(off, data, epoch, status_evt);
+    s_pio_writes++;
+    s_pio_io_writes++;
+}
+
 void cx4bus_service(void) {
-    /* v0.3.7: STREAM the HG51B instead of blocking until a job becomes idle.
+    /* v0.3.8: replay only PIO/DMA-authoritative writes into the HG51B, while
+     * streaming the core in bounded slices.
      * Real software may touch interface registers while cache/DMA/DSP work is
      * active. The upstream core already models whether a launch is accepted
      * (for example $7F4F only starts when HALT is true), so the correct host
@@ -718,9 +760,9 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_STREAMING_DEEP_QUEUE_V0.3.7 armed=%u drive=%s core1=%u core=%u "
+    printf("CX4STAT mode=LLE_PIO_WRITE_AUTHORITY_V0.3.8 armed=%u drive=%s core1=%u core=%u "
            "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
-           "ioq=%lu ioq_drop=%lu ioq_hi=%lu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
+           "ioq=%lu ioq_drop=%lu ioq_hi=%lu pio_w=%llu pio_dram=%llu pio_io=%llu sio_shadow=%llu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
            s_core ? 1u : 0u, s_rom_slot_valid ? 1u : 0u, (unsigned long)rom_size,
@@ -730,6 +772,10 @@ void cx4bus_print_status(void) {
            (unsigned long)((s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u)),
            (unsigned long)s_ioq_dropped,
            (unsigned long)s_ioq_highwater,
+           (unsigned long long)s_pio_writes,
+           (unsigned long long)s_pio_dram_writes,
+           (unsigned long long)s_pio_io_writes,
+           (unsigned long long)s_sio_shadow_writes,
            (unsigned long long)s_jobs_started,
            (unsigned long long)s_jobs_finished,
            (unsigned long long)s_job_chunks,

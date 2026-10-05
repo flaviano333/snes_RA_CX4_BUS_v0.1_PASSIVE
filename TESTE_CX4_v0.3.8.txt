@@ -1,0 +1,11 @@
+1. Build in GitHub Actions and download CX4_v0.3.8_GENERIC_SEM_ROM.uf2.
+2. Inject your own Mega Man X2 ROM with INJETAR_ROM_NO_UF2.bat.
+3. Flash the generated _COM_ROM.uf2.
+4. Before arming: CX4SELF (expected 21704 / 1024 / 1024).
+5. CX4RESET, CX4ARM, reset the SNES.
+6. After the CX4 diagnostic/title: CX4STAT, CX4RUNS, CX4TRACE.
+
+Key expectations:
+- ioq_drop=0
+- pio_w > 0 and pio_io > 0
+- first runs should return to base=028000 pb=000E pc=5C/89

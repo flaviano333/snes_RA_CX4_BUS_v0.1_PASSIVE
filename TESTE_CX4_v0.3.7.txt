@@ -1,4 +1,4 @@
-TESTE v0.3.7
+TESTE v0.3.8
 
 1) Injete sua ROM no UF2 GENERIC_SEM_ROM como nas versoes anteriores.
 2) Grave o _COM_ROM.uf2.

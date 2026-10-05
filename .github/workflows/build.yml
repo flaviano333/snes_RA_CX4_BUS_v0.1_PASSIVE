@@ -1,4 +1,4 @@
-name: Build CX4 v0.3.7 generic UF2
+name: Build CX4 v0.3.8 generic UF2
 
 on:
   workflow_dispatch:
@@ -44,10 +44,10 @@ jobs:
         run: cmake --build build
 
       - name: Rename generic UF2
-        run: cp build/snes_rp2350b_capture.uf2 build/CX4_v0.3.7_GENERIC_SEM_ROM.uf2
+        run: cp build/snes_rp2350b_capture.uf2 build/CX4_v0.3.8_GENERIC_SEM_ROM.uf2
 
       - name: Upload generic UF2
         uses: actions/upload-artifact@v4
         with:
-          name: cx4-v0.3.7-generic-uf2
-          path: build/CX4_v0.3.7_GENERIC_SEM_ROM.uf2
+          name: cx4-v0.3.8-generic-uf2
+          path: build/CX4_v0.3.8_GENERIC_SEM_ROM.uf2

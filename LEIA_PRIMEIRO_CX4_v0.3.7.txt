@@ -1,4 +1,4 @@
-SNES RP2350B - CX4 BUS v0.3.7 LLE STREAMING + DEEP QUEUE
+SNES RP2350B - CX4 BUS v0.3.8 LLE PIO-WRITE AUTHORITY
 =================================================
 
 POR QUE EXISTE ESTA VERSAO
@@ -8,7 +8,7 @@ mas NAO funciona no GitHub Actions: o runner nao possui a ROM particular do
 usuario. Alem disso, o workflow antigo nem baixava o core LLE antes de chamar
 CMake, causando o erro "CX4 LLE ausente".
 
-A v0.3.7 separa as duas coisas:
+A v0.3.8 separa as duas coisas:
   1. GitHub Actions compila um UF2 GENERICO, sem ROM comercial.
   2. No seu PC, um script injeta a SUA ROM no UF2 pronto.
 
@@ -18,7 +18,7 @@ se usar o UF2 generico gerado pelo Actions.
 GITHUB ACTIONS
 --------------
 O workflow agora baixa/adapta o core CX4 automaticamente e gera:
-  CX4_v0.3.7_GENERIC_SEM_ROM.uf2
+  CX4_v0.3.8_GENERIC_SEM_ROM.uf2
 
 Esse UF2 compila normalmente, mas CX4STAT mostrara rom_slot=0/core=0 se voce o
 gravar sem antes injetar a ROM.
@@ -28,22 +28,22 @@ INJETAR A ROM LOCALMENTE
 Depois de baixar o artifact do GitHub Actions:
 
   .\INJETAR_ROM_NO_UF2.ps1 `
-      -Uf2Path ".\CX4_v0.3.7_GENERIC_SEM_ROM.uf2" `
+      -Uf2Path ".\CX4_v0.3.8_GENERIC_SEM_ROM.uf2" `
       -RomPath "C:\ROMs\Mega Man X2 (USA).sfc"
 
 Ou:
 
-  .\INJETAR_ROM_NO_UF2.bat CX4_v0.3.7_GENERIC_SEM_ROM.uf2 "C:\ROMs\Mega Man X2 (USA).sfc"
+  .\INJETAR_ROM_NO_UF2.bat CX4_v0.3.8_GENERIC_SEM_ROM.uf2 "C:\ROMs\Mega Man X2 (USA).sfc"
 
 O script gera:
-  CX4_v0.3.7_GENERIC_SEM_ROM_COM_ROM.uf2
+  CX4_v0.3.8_GENERIC_SEM_ROM_COM_ROM.uf2
 
 E ESSE e o arquivo que deve ser gravado no RP2350B.
 
 COMO FUNCIONA
 -------------
 A SpotPear RP2350B Mini A possui 16 MB de flash. O firmware ocupa a area baixa
-e a v0.3.7 reserva um slot a partir de 4 MB para a ROM do jogo. O script apenas
+e a v0.3.8 reserva um slot a partir de 4 MB para a ROM do jogo. O script apenas
 adiciona blocos UF2 para esse slot; nao altera nem publica o arquivo .sfc/.smc.
 
 No boot o firmware procura o cabecalho "CX4R" nesse slot e, se encontrar,
@@ -62,7 +62,7 @@ TESTE
 6. Resete o SNES e rode o autoteste.
 7. Envie CX4STAT, CX4RUNS e CX4TRACE.
 
-Na v0.3.7, ioq_drop deve permanecer 0. A fila tem 8192 eventos e o HG51B
+Na v0.3.8, ioq_drop deve permanecer 0. A fila tem 8192 eventos e o HG51B
 e executado em pequenas fatias enquanto novas escritas continuam sendo consumidas.
 
 Se aparecer rom_slot=0, a ROM nao foi injetada no UF2 que voce gravou.
