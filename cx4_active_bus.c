@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3.1 LLE ROM-SLOT TURBO
+ * CX4 BUS v0.3.2 LLE ROM-SLOT TURBO
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
@@ -40,7 +40,7 @@
 #define A15_MASK (1u << 28)
 #define A22_HI_MASK (1u << (36u - 32u))
 
-/* v0.3.1 keeps the game ROM in a reserved flash slot instead of linking the
+/* v0.3.2 keeps the game ROM in a reserved flash slot instead of linking the
  * copyrighted ROM into the CI build.  The generic UF2 is built on GitHub; a
  * local Python tool then appends the user's own ROM as UF2 blocks at 4 MiB. */
 #define CX4_ROM_SLOT_FLASH_OFFSET (4u * 1024u * 1024u)
@@ -322,7 +322,7 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_ROM_SLOT_TURBO_V0.3.1 armed=%u drive=%s core1=%u core=%u "
+    printf("CX4STAT mode=LLE_ROM_SLOT_TURBO_V0.3.2 armed=%u drive=%s core1=%u core=%u "
            "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
            "cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
