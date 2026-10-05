@@ -710,6 +710,8 @@ static void print_help(void) {
     printf("  CHEESE                  show $1558/$155C values and targeted counters\n");
     printf("  CX4STAT                 show active CX4 bus/interface counters\n");
     printf("  CX4TRACE                show last 64 active CX4 IO reads/writes\n");
+    printf("  CX4RUNS                 show recent HG51B program starts (base/PB/PC)\n");
+    printf("  CX4SELF                 run local ROM/core diagnostic without SNES bus\n");
     printf("  CX4ARM                  ENABLE D0-D7 response for CX4 reads (then reset SNES)\n");
     printf("  CX4DISARM               disable active response; D0-D7 immediately INPUT\n");
     printf("  CX4RESET                reset virtual CX4 state without changing armed state\n");
@@ -1077,6 +1079,10 @@ static void execute_command(char *line) {
         cx4bus_print_status();
     } else if (!strcmp(cmd, "CX4TRACE")) {
         cx4bus_print_trace();
+    } else if (!strcmp(cmd, "CX4RUNS")) {
+        cx4bus_print_runs();
+    } else if (!strcmp(cmd, "CX4SELF")) {
+        cx4bus_selfcheck();
     } else if (!strcmp(cmd, "CX4ARM")) {
         cx4bus_arm(true);
         printf("OK CX4 ACTIVE armed. D0-D7 are driven ONLY on decoded CX4 reads. Reset the SNES now.\n");
@@ -1218,7 +1224,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + CX4 BUS v0.3.5 LLE FAST-STATUS HANDSHAKE ===\n");
+    printf("\n=== SNES RP2350B RA + CX4 BUS v0.3.6 LLE ORDERED-JOBS + SELFTEST ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
@@ -1354,7 +1360,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.3.5 FAST-STATUS HANDSHAKE available; drive starts OFF.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.3.6 ORDERED-JOBS + SELFTEST available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
