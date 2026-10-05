@@ -1,4 +1,4 @@
-1. Build in GitHub Actions and download CX4_v0.3.8_GENERIC_SEM_ROM.uf2.
+1. Build in GitHub Actions and download CX4_v0.4_GENERIC_SEM_ROM.uf2.
 2. Inject your own Mega Man X2 ROM with INJETAR_ROM_NO_UF2.bat.
 3. Flash the generated _COM_ROM.uf2.
 4. Before arming: CX4SELF (expected 21704 / 1024 / 1024).

@@ -1,0 +1,10 @@
+CX4 BUS v0.4 - SPRITE-FIRST HLE + LLE FALLBACK
+
+- Mantem CX4SELF/LLE da v0.3.8.
+- Mantem PIO+DMA como autoridade de escritas.
+- Novo fast path de gameplay para PC $00 + subcomando $00.
+- Reconstroi a tabela OAM a partir da interface RAM e de descriptors na ROM
+  injetada, com mapeamento LoROM.
+- Nao rouba os programas $5C/$89 do autoteste (subcomando $0E).
+- Novos contadores hle_jobs/hle_groups/hle_oam/hle_romfail.
+- Objetivo deliberado: sprites visiveis primeiro; autoteste completo depois.

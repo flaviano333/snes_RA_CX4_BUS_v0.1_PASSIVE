@@ -1,0 +1,40 @@
+CX4 BUS v0.4 - SPRITE-FIRST HLE + LLE FALLBACK
+================================================
+
+Objetivo desta versao: parar de usar o autoteste de X2 como unico alvo e
+priorizar algo visivel: restaurar a montagem OAM dos sprites comuns do jogo.
+
+O core LLE/ROM continuam presentes e CX4SELF continua sendo o teste de referencia.
+A v0.4 intercepta APENAS:
+  $7F4F = $00 quando $7F4D = $00
+que e o caminho de construcao de OAM/sprites usado repetidamente por Mega Man X2.
+
+Ela NAO tenta fazer o CX4 TEST PROGRAM ficar todo OK. E normal o diagnostico do
+jogo continuar mostrando ERROR enquanto testamos a camada HLE de gameplay.
+
+Teste:
+  1. Build no GitHub Actions.
+  2. Injete sua ROM de Mega Man X2 no UF2 generico.
+  3. Grave o *_COM_ROM.uf2.
+  4. Rode CX4SELF (deve continuar 21704 / 1024 / 1024).
+  5. CX4RESET
+  6. CX4ARM
+  7. Reset no SNES e entre no jogo.
+  8. Rode CX4STAT.
+
+Campos novos:
+  hle_sprite=1
+  hle_jobs=       quantidade de jobs de sprite interceptados
+  hle_groups=     grupos de sprites processados
+  hle_oam=        entradas OAM efetivamente geradas
+  hle_romfail=    ponteiros de sprite que nao mapearam para a ROM
+  hle_ptr=        ultimo ponteiro SNES de descriptor consultado
+  hle_sub=        ultimo subcomando visto
+
+Sinal de sucesso minimo:
+  hle_jobs sobe continuamente, hle_oam > 0 e hle_romfail fica 0 ou muito baixo.
+  O personagem e inimigos devem comecar a aparecer, mesmo que efeitos especiais
+  e o autoteste do CX4 ainda nao estejam perfeitos.
+
+Esta versao continua experimental e dirige D0-D7 diretamente somente quando
+CX4ARM estiver ativo.

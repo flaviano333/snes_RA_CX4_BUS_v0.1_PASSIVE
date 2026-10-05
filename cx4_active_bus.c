@@ -10,18 +10,19 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3.8 LLE PIO-WRITE AUTHORITY
+ * CX4 BUS v0.4 SPRITE-FIRST HLE + LLE FALLBACK
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
  * RetroPortingToolKit/snesrecomp CX4 implementation; it is not redistributed
  * in this package. The user's own game ROM is injected locally into a reserved flash slot after build.
  *
- * v0.3.8 keeps the active READ responder on core1, but makes the proven
- * PIO+DMA write capture authoritative for all CX4 writes. Core1 may still
- * create immediate CPU-visible shadow/status changes so back-to-back write/read
- * tests remain responsive; the LLE core itself receives only PIO/DMA-captured
- * bytes sampled at PHI2 falling edge.
+ * v0.4 keeps the proven active bus + PIO/DMA write path, but adds a narrow
+ * compatibility HLE for the runtime sprite-OAM job used heavily by Mega Man X2.
+ * The boot/self-test remains on the permissive LLE core. When the CPU writes
+ * PC=$00 with sprite subcommand $00, the RP2350 builds the OAM result directly
+ * from CX4 interface RAM and the user-injected LoROM image. This intentionally
+ * prioritizes visible gameplay sprites over making the diagnostic ROM perfect.
  */
 
 #define PIN_PHI2       0u
@@ -134,6 +135,186 @@ static volatile uint64_t s_pio_writes = 0;
 static volatile uint64_t s_pio_dram_writes = 0;
 static volatile uint64_t s_pio_io_writes = 0;
 static volatile uint64_t s_sio_shadow_writes = 0;
+
+/* v0.4 sprite-first compatibility layer.
+ * This is intentionally narrow: only the ordinary sprite/OAM build request
+ * (PC $00, subcommand $00 at $7F4D) is intercepted. Other CX4 programs keep
+ * using the LLE core, so CX4SELF remains a clean LLE validation. */
+static volatile bool s_sprite_hle_enabled = true;
+static volatile uint64_t s_hle_sprite_jobs = 0;
+static volatile uint64_t s_hle_sprite_objects = 0;
+static volatile uint64_t s_hle_oam_entries = 0;
+static volatile uint64_t s_hle_rom_ptr_fail = 0;
+static volatile uint32_t s_hle_last_ptr = 0;
+static volatile uint8_t s_hle_last_subcmd = 0xffu;
+
+static void status_override_update(uint8_t mask, uint8_t value);
+
+static inline uint8_t hle_ram_get(uint16_t i) {
+    i &= 0x1fffu;
+    if (i < 0x0c00u) return s_dram ? s_dram[i] : 0u;
+    if (i >= 0x1000u && i < 0x1c00u) return s_dram ? s_dram[i & 0x0fffu] : 0u;
+    return s_io_shadow[i & 0x03ffu];
+}
+
+static inline void hle_ram_put(uint16_t i, uint8_t v) {
+    i &= 0x1fffu;
+    if (i < 0x0c00u) {
+        if (s_dram) s_dram[i] = v;
+        return;
+    }
+    if (i >= 0x1000u && i < 0x1c00u) {
+        if (s_dram) s_dram[i & 0x0fffu] = v;
+        return;
+    }
+    s_io_shadow[i & 0x03ffu] = v;
+}
+
+static inline uint16_t hle_ram16(uint16_t i) {
+    return (uint16_t)hle_ram_get(i) | ((uint16_t)hle_ram_get((uint16_t)(i + 1u)) << 8);
+}
+
+static inline uint32_t hle_ram24(uint16_t i) {
+    return (uint32_t)hle_ram_get(i) |
+           ((uint32_t)hle_ram_get((uint16_t)(i + 1u)) << 8) |
+           ((uint32_t)hle_ram_get((uint16_t)(i + 2u)) << 16);
+}
+
+/* Mega Man X2 is LoROM. Convert a 24-bit SNES ROM pointer to the local ROM
+ * image injected at 4 MiB. We reject low-half addresses instead of guessing;
+ * a bad pointer is safer as a visible diagnostic than an out-of-range read. */
+static bool hle_lorom_ptr(uint32_t snes_addr, uint32_t need, const uint8_t **out) {
+    if (!s_rom_slot_valid || !s_game_rom || !s_game_rom_size) return false;
+    uint8_t bank = (uint8_t)(snes_addr >> 16);
+    uint16_t addr = (uint16_t)snes_addr;
+    if (addr < 0x8000u) return false;
+    uint32_t off = ((uint32_t)(bank & 0x7fu) << 15) | (uint32_t)(addr & 0x7fffu);
+    if (off >= s_game_rom_size || need > s_game_rom_size - off) return false;
+    *out = s_game_rom + off;
+    return true;
+}
+
+static inline void hle_oam_high_set(uint8_t sprite_index, bool x_high, bool large) {
+    uint16_t a = (uint16_t)(0x0200u + (sprite_index >> 2));
+    uint8_t shift = (uint8_t)((sprite_index & 3u) * 2u);
+    uint8_t v = hle_ram_get(a);
+    v &= (uint8_t)~(3u << shift);
+    if (x_high) v |= (uint8_t)(1u << shift);
+    if (large)  v |= (uint8_t)(2u << shift);
+    hle_ram_put(a, v);
+}
+
+/* Build the SNES OAM staging table used by the normal Mega Man X2 sprite path.
+ * Input records live at CX4 RAM +$0220. Each record points to a compact sprite
+ * assembly in cartridge ROM; the output low OAM table starts at +$0000 and the
+ * packed high OAM bits at +$0200. */
+static bool hle_build_oam(void) {
+    if (!s_dram || !s_game_rom) return false;
+
+    const uint8_t first = hle_ram_get(0x0626u);
+    uint8_t out_index = first;
+    uint16_t out = (uint16_t)first * 4u;
+    const int16_t global_x = (int16_t)hle_ram16(0x0621u);
+    const int16_t global_y = (int16_t)hle_ram16(0x0623u);
+    const uint8_t groups = hle_ram_get(0x0620u);
+
+    /* Hide unused OAM records first. */
+    for (uint16_t n = first; n < 128u; ++n)
+        hle_ram_put((uint16_t)(n * 4u + 1u), 0xe0u);
+
+    uint16_t src = 0x0220u;
+    uint16_t groups_done = 0;
+    uint16_t emitted = 0;
+
+    for (uint16_t g = 0; g < groups && out_index < 128u; ++g, src = (uint16_t)(src + 16u)) {
+        if ((uint32_t)src + 15u >= 0x0c00u) break;
+        groups_done++;
+
+        int16_t sx = (int16_t)hle_ram16(src) - global_x;
+        int16_t sy = (int16_t)hle_ram16((uint16_t)(src + 2u)) - global_y;
+        uint8_t name = hle_ram_get((uint16_t)(src + 5u));
+        uint8_t attr = (uint8_t)(hle_ram_get((uint16_t)(src + 4u)) |
+                                 hle_ram_get((uint16_t)(src + 6u)));
+        uint32_t ptr24 = hle_ram24((uint16_t)(src + 7u));
+        s_hle_last_ptr = ptr24;
+
+        const uint8_t *rom = NULL;
+        if (!hle_lorom_ptr(ptr24, 1u, &rom)) {
+            s_hle_rom_ptr_fail++;
+            continue;
+        }
+
+        uint8_t parts = rom[0];
+        if (parts) {
+            const uint8_t *list = NULL;
+            uint32_t bytes = 1u + (uint32_t)parts * 4u;
+            if (!hle_lorom_ptr(ptr24, bytes, &list)) {
+                s_hle_rom_ptr_fail++;
+                continue;
+            }
+            list++;
+
+            for (uint16_t k = 0; k < parts && out_index < 128u; ++k, list += 4) {
+                uint8_t flags = list[0];
+                int16_t dx = (int8_t)list[1];
+                int16_t dy = (int8_t)list[2];
+                uint8_t tile_delta = list[3];
+                bool large = (flags & 0x20u) != 0;
+
+                if (attr & 0x40u) dx = (int16_t)(-dx - (large ? 16 : 8));
+                if (attr & 0x80u) dy = (int16_t)(-dy - (large ? 16 : 8));
+                int16_t x = (int16_t)(sx + dx);
+                int16_t y = (int16_t)(sy + dy);
+
+                if (x < -16 || x > 272 || y < -16 || y > 224) continue;
+
+                hle_ram_put(out + 0u, (uint8_t)x);
+                hle_ram_put(out + 1u, (uint8_t)y);
+                hle_ram_put(out + 2u, (uint8_t)(name + tile_delta));
+                hle_ram_put(out + 3u, (uint8_t)(attr ^ (flags & 0xc0u)));
+                hle_oam_high_set(out_index, (x & 0x100) != 0, large);
+                out = (uint16_t)(out + 4u);
+                out_index++;
+                emitted++;
+            }
+        } else if (out_index < 128u) {
+            /* A zero-part descriptor represents the base object itself. */
+            hle_ram_put(out + 0u, (uint8_t)sx);
+            hle_ram_put(out + 1u, (uint8_t)sy);
+            hle_ram_put(out + 2u, name);
+            hle_ram_put(out + 3u, attr);
+            hle_oam_high_set(out_index, (sx & 0x100) != 0, true);
+            out = (uint16_t)(out + 4u);
+            out_index++;
+            emitted++;
+        }
+    }
+
+    s_hle_sprite_objects += groups_done;
+    s_hle_oam_entries += emitted;
+    return true;
+}
+
+static bool hle_try_runtime_job(uint16_t off, uint8_t data) {
+    if (!s_sprite_hle_enabled || (off & 0x03ffu) != 0x034fu || data != 0x00u)
+        return false;
+
+    /* $7F4D=$0E belongs to the boot diagnostic/immediate tests. Only steal the
+     * normal sprite function path ($7F4D=$00) from LLE. */
+    uint8_t sub = s_io_shadow[0x34du];
+    s_hle_last_subcmd = sub;
+    if (sub != 0x00u) return false;
+
+    /* Present BUSY/RUNNING while producing the OAM table, then complete. */
+    status_override_update(0xc0u, 0xc0u);
+    bool ok = hle_build_oam();
+    s_hle_sprite_jobs++;
+    s_halt_shadow = true;
+    s_work_pending = false;
+    s_io_shadow[0x35eu] = 0u;
+    __atomic_store_n(&s_status_override, 0u, __ATOMIC_RELEASE);
+    return ok;
+}
 static volatile uint64_t s_reset_vectors = 0;
 static volatile uint64_t s_state_resets = 0;
 static volatile uint32_t s_last_read_addr = 0;
@@ -433,6 +614,8 @@ void cx4bus_init(void) {
     s_ioq_dropped = 0;
     s_pio_writes = s_pio_dram_writes = s_pio_io_writes = 0;
     s_sio_shadow_writes = 0;
+    s_hle_sprite_jobs = s_hle_sprite_objects = s_hle_oam_entries = s_hle_rom_ptr_fail = 0;
+    s_hle_last_ptr = 0; s_hle_last_subcmd = 0xffu;
     if (s_core) publish_io_shadow_core0();
 
     s_master_clock = 1;
@@ -586,6 +769,15 @@ void cx4bus_pio_write(uint32_t address, uint8_t data) {
     io_shadow_cpu_write(off, data);
     const bool status_evt = write_changes_status(off);
     if (status_evt) status_on_cpu_write(off, data);
+
+    /* v0.4: a narrow gameplay-first fast path. Do not enqueue this sprite job
+     * into the LLE after HLE has already produced its output. */
+    if (hle_try_runtime_job(off, data)) {
+        s_pio_writes++;
+        s_pio_io_writes++;
+        return;
+    }
+
     const uint16_t epoch = status_evt ? status_override_epoch() : 0u;
     ioq_push(off, data, epoch, status_evt);
     s_pio_writes++;
@@ -760,8 +952,8 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_PIO_WRITE_AUTHORITY_V0.3.8 armed=%u drive=%s core1=%u core=%u "
-           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
+    printf("CX4STAT mode=SPRITE_FIRST_HLE_V0.4 armed=%u drive=%s core1=%u core=%u "
+           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u hle_sprite=%u hle_jobs=%llu hle_groups=%llu hle_oam=%llu hle_romfail=%llu hle_ptr=%06lX hle_sub=%02X "
            "ioq=%lu ioq_drop=%lu ioq_hi=%lu pio_w=%llu pio_dram=%llu pio_io=%llu sio_shadow=%llu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
@@ -769,6 +961,12 @@ void cx4bus_print_status(void) {
            (unsigned long)s_game_rom_crc32, fw, locked,
            (unsigned long)runs, (unsigned long long)insns, (unsigned long)rdrom,
            (unsigned long long)s_turbo_runs, s_work_pending ? 1u : 0u,
+           s_sprite_hle_enabled ? 1u : 0u,
+           (unsigned long long)s_hle_sprite_jobs,
+           (unsigned long long)s_hle_sprite_objects,
+           (unsigned long long)s_hle_oam_entries,
+           (unsigned long long)s_hle_rom_ptr_fail,
+           (unsigned long)s_hle_last_ptr, s_hle_last_subcmd,
            (unsigned long)((s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u)),
            (unsigned long)s_ioq_dropped,
            (unsigned long)s_ioq_highwater,
