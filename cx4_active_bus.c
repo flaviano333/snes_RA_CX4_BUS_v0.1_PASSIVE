@@ -10,18 +10,17 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.4.1 SPRITE ROM-MAP FIX + LLE FALLBACK
+ * CX4 BUS v0.4.2 EXACT-OAM SNAPSHOT + ZERO-PAD
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
  * RetroPortingToolKit/snesrecomp CX4 implementation; it is not redistributed
  * in this package. The user's own game ROM is injected locally into a reserved flash slot after build.
  *
- * v0.4.1 keeps the proven active bus + PIO/DMA write path and fixes the
- * runtime sprite-OAM HLE ROM pointer mapping to match the CX4/Snes9x mapping.
- * The boot/self-test remains on the permissive LLE core. Runtime OAM building
- * accepts both high-half and low-half 16-bit addresses exactly as the CX4 ROM
- * pointer mapping does; the previous v0.4 incorrectly rejected addr<$8000.
+ * v0.4.2 keeps the proven active bus + PIO/DMA write path, but makes the
+ * sprite-first HLE deterministic: each OAM job snapshots the 3 KiB CX4 DRAM
+ * before conversion, and cartridge ROM reads use zero-padded linear ROM
+ * semantics. The OAM conversion follows mature C4 HLE behavior closely.
  */
 
 #define PIN_PHI2       0u
@@ -146,8 +145,13 @@ static volatile uint64_t s_hle_oam_entries = 0;
 static volatile uint64_t s_hle_rom_ptr_fail = 0;
 static volatile uint64_t s_hle_rom_lowhalf = 0;
 static volatile uint64_t s_hle_rom_oor = 0;
+static volatile uint64_t s_hle_zero_pad_reads = 0;
+static volatile uint64_t s_hle_zero_pad_ptrs = 0;
+static volatile uint64_t s_hle_snapshot_jobs = 0;
+static volatile uint32_t s_hle_parts_max = 0;
 static volatile uint32_t s_hle_last_ptr = 0;
 static volatile uint8_t s_hle_last_subcmd = 0xffu;
+static uint8_t s_hle_snapshot[0x0c00];
 
 static void status_override_update(uint8_t mask, uint8_t value);
 
@@ -181,117 +185,136 @@ static inline uint32_t hle_ram24(uint16_t i) {
            ((uint32_t)hle_ram_get((uint16_t)(i + 2u)) << 16);
 }
 
-/* CX4 cartridge-ROM pointer mapping. This intentionally matches the mapping
- * used by mature CX4 emulation: ((addr & $ff0000) >> 1) + (addr & $7fff).
- * Important: the 16-bit address is NOT required to be >= $8000. CX4 sprite
- * descriptors legitimately use low-half aliases; v0.4 rejected those and
- * therefore discarded most sprite assemblies. */
-static bool hle_lorom_ptr(uint32_t snes_addr, uint32_t need, const uint8_t **out) {
-    if (!s_rom_slot_valid || !s_game_rom || !s_game_rom_size) return false;
+/* C4 cartridge-ROM pointer mapping. Mature C4 HLE code indexes a large ROM
+ * allocation directly. The loaded image occupies rom_size bytes; the rest of
+ * that allocation is zero. v0.4.1 skipped an object when a pointer exceeded the
+ * injected file, which does not match that behavior. */
+static inline uint32_t hle_rom_offset(uint32_t snes_addr) {
     uint16_t addr = (uint16_t)snes_addr;
     if (addr < 0x8000u) s_hle_rom_lowhalf++;
-    uint32_t off = ((snes_addr & 0xff0000u) >> 1) + (snes_addr & 0x7fffu);
-    if (off >= s_game_rom_size || need > s_game_rom_size - off) {
-        s_hle_rom_oor++;
-        return false;
-    }
-    *out = s_game_rom + off;
-    return true;
+    return ((snes_addr & 0xff0000u) >> 1) + (snes_addr & 0x7fffu);
 }
 
-static inline void hle_oam_high_set(uint8_t sprite_index, bool x_high, bool large) {
-    uint16_t a = (uint16_t)(0x0200u + (sprite_index >> 2));
-    uint8_t shift = (uint8_t)((sprite_index & 3u) * 2u);
-    uint8_t v = hle_ram_get(a);
-    v &= (uint8_t)~(3u << shift);
-    if (x_high) v |= (uint8_t)(1u << shift);
-    if (large)  v |= (uint8_t)(2u << shift);
-    hle_ram_put(a, v);
+static inline uint8_t hle_rom_byte_off(uint32_t off, bool *zero_padded) {
+    if (s_rom_slot_valid && s_game_rom && off < s_game_rom_size)
+        return s_game_rom[off];
+    s_hle_zero_pad_reads++;
+    if (zero_padded) *zero_padded = true;
+    return 0u;
 }
 
-/* Build the SNES OAM staging table used by the normal Mega Man X2 sprite path.
- * Input records live at CX4 RAM +$0220. Each record points to a compact sprite
- * assembly in cartridge ROM; the output low OAM table starts at +$0000 and the
- * packed high OAM bits at +$0200. */
+static inline uint8_t hle_in8(uint16_t i) {
+    return (i < 0x0c00u) ? s_hle_snapshot[i] : 0u;
+}
+static inline uint16_t hle_in16(uint16_t i) {
+    return (uint16_t)hle_in8(i) | ((uint16_t)hle_in8((uint16_t)(i + 1u)) << 8);
+}
+static inline uint32_t hle_in24(uint16_t i) {
+    return (uint32_t)hle_in8(i) |
+           ((uint32_t)hle_in8((uint16_t)(i + 1u)) << 8) |
+           ((uint32_t)hle_in8((uint16_t)(i + 2u)) << 16);
+}
+
+/* Ordinary C4 OAM conversion, using a stable snapshot for all inputs. Outputs
+ * are committed to live C4 RAM, exactly where the SNES expects the OAM staging
+ * table ($6000-$621F). */
 static bool hle_build_oam(void) {
     if (!s_dram || !s_game_rom) return false;
 
-    const uint8_t first = hle_ram_get(0x0626u);
-    uint8_t out_index = first;
-    uint16_t out = (uint16_t)first * 4u;
-    const int16_t global_x = (int16_t)hle_ram16(0x0621u);
-    const int16_t global_y = (int16_t)hle_ram16(0x0623u);
-    const uint8_t groups = hle_ram_get(0x0620u);
+    memcpy(s_hle_snapshot, s_dram, sizeof(s_hle_snapshot));
+    s_hle_snapshot_jobs++;
 
-    /* Hide unused OAM records first. */
-    for (uint16_t n = first; n < 128u; ++n)
-        hle_ram_put((uint16_t)(n * 4u + 1u), 0xe0u);
+    const uint8_t first = hle_in8(0x0626u);
+    uint8_t spr_count = (uint8_t)(128u - first);
+    uint8_t offset = (uint8_t)((first & 3u) * 2u);
+    uint16_t oam = (uint16_t)first << 2;
+    uint16_t oam2 = (uint16_t)(0x0200u + (first >> 2));
+    const int16_t global_x = (int16_t)hle_in16(0x0621u);
+    const int16_t global_y = (int16_t)hle_in16(0x0623u);
+    const uint8_t groups = hle_in8(0x0620u);
+
+    /* Hide unused low-OAM entries by setting their Y coordinate to E0. */
+    if (oam < 0x0200u) {
+        for (int i = 0x01fd; i > (int)oam; i -= 4)
+            hle_ram_put((uint16_t)i, 0xe0u);
+    }
 
     uint16_t src = 0x0220u;
     uint16_t groups_done = 0;
     uint16_t emitted = 0;
 
-    for (uint16_t g = 0; g < groups && out_index < 128u; ++g, src = (uint16_t)(src + 16u)) {
-        if ((uint32_t)src + 15u >= 0x0c00u) break;
+    for (uint16_t gi = 0; gi < groups && spr_count > 0u; ++gi, src = (uint16_t)(src + 16u)) {
+        if ((uint32_t)src + 15u >= sizeof(s_hle_snapshot)) break;
         groups_done++;
 
-        int16_t sx = (int16_t)hle_ram16(src) - global_x;
-        int16_t sy = (int16_t)hle_ram16((uint16_t)(src + 2u)) - global_y;
-        uint8_t name = hle_ram_get((uint16_t)(src + 5u));
-        uint8_t attr = (uint8_t)(hle_ram_get((uint16_t)(src + 4u)) |
-                                 hle_ram_get((uint16_t)(src + 6u)));
-        uint32_t ptr24 = hle_ram24((uint16_t)(src + 7u));
+        int16_t spr_x = (int16_t)hle_in16(src) - global_x;
+        int16_t spr_y = (int16_t)hle_in16((uint16_t)(src + 2u)) - global_y;
+        uint8_t spr_name = hle_in8((uint16_t)(src + 5u));
+        uint8_t spr_attr = (uint8_t)(hle_in8((uint16_t)(src + 4u)) |
+                                     hle_in8((uint16_t)(src + 6u)));
+        uint32_t ptr24 = hle_in24((uint16_t)(src + 7u));
         s_hle_last_ptr = ptr24;
 
-        const uint8_t *rom = NULL;
-        if (!hle_lorom_ptr(ptr24, 1u, &rom)) {
-            s_hle_rom_ptr_fail++;
-            continue;
+        uint32_t rp = hle_rom_offset(ptr24);
+        bool zero_ptr = false;
+        uint8_t parts = hle_rom_byte_off(rp, &zero_ptr);
+        if (zero_ptr) {
+            s_hle_zero_pad_ptrs++;
+            s_hle_rom_oor++;
         }
+        if (parts > s_hle_parts_max) s_hle_parts_max = parts;
 
-        uint8_t parts = rom[0];
-        if (parts) {
-            const uint8_t *list = NULL;
-            uint32_t bytes = 1u + (uint32_t)parts * 4u;
-            if (!hle_lorom_ptr(ptr24, bytes, &list)) {
-                s_hle_rom_ptr_fail++;
-                continue;
-            }
-            list++;
+        if (parts != 0u) {
+            rp++;
+            for (uint16_t si = 0; si < parts && spr_count > 0u; ++si, rp += 4u) {
+                uint8_t flags = hle_rom_byte_off(rp + 0u, NULL);
+                int16_t x = (int8_t)hle_rom_byte_off(rp + 1u, NULL);
+                int16_t y = (int8_t)hle_rom_byte_off(rp + 2u, NULL);
+                uint8_t tile_delta = hle_rom_byte_off(rp + 3u, NULL);
+                const bool large = (flags & 0x20u) != 0u;
 
-            for (uint16_t k = 0; k < parts && out_index < 128u; ++k, list += 4) {
-                uint8_t flags = list[0];
-                int16_t dx = (int8_t)list[1];
-                int16_t dy = (int8_t)list[2];
-                uint8_t tile_delta = list[3];
-                bool large = (flags & 0x20u) != 0;
+                if (spr_attr & 0x40u) x = (int16_t)(-x - (large ? 16 : 8));
+                x = (int16_t)(x + spr_x);
+                if (x < -16 || x > 272) continue;
 
-                if (attr & 0x40u) dx = (int16_t)(-dx - (large ? 16 : 8));
-                if (attr & 0x80u) dy = (int16_t)(-dy - (large ? 16 : 8));
-                int16_t x = (int16_t)(sx + dx);
-                int16_t y = (int16_t)(sy + dy);
+                if (spr_attr & 0x80u) y = (int16_t)(-y - (large ? 16 : 8));
+                y = (int16_t)(y + spr_y);
+                if (y < -16 || y > 224) continue;
 
-                if (x < -16 || x > 272 || y < -16 || y > 224) continue;
+                hle_ram_put(oam + 0u, (uint8_t)x);
+                hle_ram_put(oam + 1u, (uint8_t)y);
+                hle_ram_put(oam + 2u, (uint8_t)(spr_name + tile_delta));
+                hle_ram_put(oam + 3u, (uint8_t)(spr_attr ^ (flags & 0xc0u)));
 
-                hle_ram_put(out + 0u, (uint8_t)x);
-                hle_ram_put(out + 1u, (uint8_t)y);
-                hle_ram_put(out + 2u, (uint8_t)(name + tile_delta));
-                hle_ram_put(out + 3u, (uint8_t)(attr ^ (flags & 0xc0u)));
-                hle_oam_high_set(out_index, (x & 0x100) != 0, large);
-                out = (uint16_t)(out + 4u);
-                out_index++;
+                uint8_t hv = hle_ram_get(oam2);
+                hv &= (uint8_t)~(3u << offset);
+                if (x & 0x100) hv |= (uint8_t)(1u << offset);
+                if (large) hv |= (uint8_t)(2u << offset);
+                hle_ram_put(oam2, hv);
+
+                oam = (uint16_t)(oam + 4u);
+                spr_count--;
                 emitted++;
+                offset = (uint8_t)((offset + 2u) & 6u);
+                if (offset == 0u) oam2++;
             }
-        } else if (out_index < 128u) {
-            /* A zero-part descriptor represents the base object itself. */
-            hle_ram_put(out + 0u, (uint8_t)sx);
-            hle_ram_put(out + 1u, (uint8_t)sy);
-            hle_ram_put(out + 2u, name);
-            hle_ram_put(out + 3u, attr);
-            hle_oam_high_set(out_index, (sx & 0x100) != 0, true);
-            out = (uint16_t)(out + 4u);
-            out_index++;
+        } else if (spr_count > 0u) {
+            /* A zero assembly count represents the base object itself. */
+            hle_ram_put(oam + 0u, (uint8_t)spr_x);
+            hle_ram_put(oam + 1u, (uint8_t)spr_y);
+            hle_ram_put(oam + 2u, spr_name);
+            hle_ram_put(oam + 3u, spr_attr);
+
+            uint8_t hv = hle_ram_get(oam2);
+            hv &= (uint8_t)~(3u << offset);
+            hv |= (uint8_t)((spr_x & 0x100) ? (3u << offset) : (2u << offset));
+            hle_ram_put(oam2, hv);
+
+            oam = (uint16_t)(oam + 4u);
+            spr_count--;
             emitted++;
+            offset = (uint8_t)((offset + 2u) & 6u);
+            if (offset == 0u) oam2++;
         }
     }
 
@@ -621,6 +644,8 @@ void cx4bus_init(void) {
     s_sio_shadow_writes = 0;
     s_hle_sprite_jobs = s_hle_sprite_objects = s_hle_oam_entries = s_hle_rom_ptr_fail = 0;
     s_hle_rom_lowhalf = s_hle_rom_oor = 0;
+    s_hle_zero_pad_reads = s_hle_zero_pad_ptrs = s_hle_snapshot_jobs = 0;
+    s_hle_parts_max = 0;
     s_hle_last_ptr = 0; s_hle_last_subcmd = 0xffu;
     if (s_core) publish_io_shadow_core0();
 
@@ -958,8 +983,8 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=SPRITE_ROMMAP_FIX_V0.4.1 armed=%u drive=%s core1=%u core=%u "
-           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u hle_sprite=%u hle_jobs=%llu hle_groups=%llu hle_oam=%llu hle_romfail=%llu hle_lowhalf=%llu hle_oor=%llu hle_ptr=%06lX hle_sub=%02X "
+    printf("CX4STAT mode=EXACT_OAM_SNAPSHOT_ZEROPAD_V0.4.2 armed=%u drive=%s core1=%u core=%u "
+           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u hle_sprite=%u hle_jobs=%llu hle_groups=%llu hle_oam=%llu hle_romfail=%llu hle_lowhalf=%llu hle_oor=%llu hle_zpad=%llu hle_zptr=%llu hle_snap=%llu hle_pmax=%lu hle_ptr=%06lX hle_sub=%02X "
            "ioq=%lu ioq_drop=%lu ioq_hi=%lu pio_w=%llu pio_dram=%llu pio_io=%llu sio_shadow=%llu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
@@ -974,6 +999,10 @@ void cx4bus_print_status(void) {
            (unsigned long long)s_hle_rom_ptr_fail,
            (unsigned long long)s_hle_rom_lowhalf,
            (unsigned long long)s_hle_rom_oor,
+           (unsigned long long)s_hle_zero_pad_reads,
+           (unsigned long long)s_hle_zero_pad_ptrs,
+           (unsigned long long)s_hle_snapshot_jobs,
+           (unsigned long)s_hle_parts_max,
            (unsigned long)s_hle_last_ptr, s_hle_last_subcmd,
            (unsigned long)((s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u)),
            (unsigned long)s_ioq_dropped,

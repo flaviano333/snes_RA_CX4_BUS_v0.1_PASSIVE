@@ -1,0 +1,7 @@
+CX4 BUS v0.4.2 - EXACT OAM SNAPSHOT + ZERO-PAD
+
+- Sprite HLE snapshots the 3 KiB CX4 DRAM before each OAM conversion.
+- OAM conversion follows mature C4 HLE behavior closely.
+- ROM addresses beyond the injected file read as zero instead of dropping the object.
+- Adds hle_zpad, hle_zptr, hle_snap and hle_pmax diagnostics.
+- LLE self-test and RA v2.0 READ-REPAIR are unchanged.
