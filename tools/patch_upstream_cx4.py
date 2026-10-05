@@ -134,7 +134,7 @@ s, _ = remove_function(s, "cx4_saveload", required=False)
 # makes an incompatible API change, fail here with a useful message instead of
 # producing mysterious compiler errors later.
 required_symbols = [
-    "cx4_create", "cx4_reset", "cx4_sync", "cx4_read", "cx4_write",
+    "cx4_create", "cx4_reset", "cx4_sync", "cx4_read", "cx4_write", "cx4_ram_ptr",
     "cx4_synthesize_data_rom", "cx4_firmware_loaded",
     "cx4_instructions_executed", "cx4_rdrom_hits", "cx4_run_ring_count",
     "cx4_locked",
@@ -144,4 +144,4 @@ if missing:
     raise SystemExit("API CX4 upstream incompativel; faltando: " + ", ".join(missing))
 
 p.write_text(s, encoding="utf-8", newline="\n")
-print("Core CX4 upstream adaptado para bare metal (patch estrutural v0.3.3).")
+print("Core CX4 upstream adaptado para bare metal (patch estrutural v0.3.4).")

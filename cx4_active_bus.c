@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3.3 LLE FAST-BUS TRACE
+ * CX4 BUS v0.3.4 LLE SINGLE-OWNER SHADOW
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
@@ -77,6 +77,18 @@ static void cx4_rom_slot_probe(void) {
 }
 
 static Cx4 *s_core = NULL;
+/* Fast CPU-visible interface. Core1 NEVER calls cx4_read/cx4_write in v0.3.4.
+ * Core0 is the sole owner of the HG51B control/register state; core1 serves
+ * the physical SNES bus from this shadow plus the core dataRAM byte array. */
+static uint8_t *s_dram = NULL;
+static volatile uint8_t s_io_shadow[0x400];
+
+typedef struct { uint16_t off; uint8_t data; } cx4_io_write_evt_t;
+#define CX4_IOQ_N 512u
+static volatile cx4_io_write_evt_t s_ioq[CX4_IOQ_N];
+static volatile uint32_t s_ioq_head = 0;
+static volatile uint32_t s_ioq_tail = 0;
+static volatile uint32_t s_ioq_dropped = 0;
 static volatile bool s_armed = false;
 static volatile bool s_core1_started = false;
 static volatile bool s_driving = false;
@@ -187,8 +199,74 @@ static inline uint16_t canonical_io(uint16_t off) {
 static inline bool write_can_start_work(uint16_t off) {
     if (!off_is_io(off)) return false;
     uint16_t a = canonical_io(off);
+    /* Only operations that can actually make the engine advance. Halt and
+     * suspend writes must not manufacture a fresh turbo run. */
     return a == 0x7f47u || a == 0x7f48u || a == 0x7f4fu ||
-           (a >= 0x7f53u && a <= 0x7f5du);
+           (a >= 0x7f56u && a <= 0x7f5du);
+}
+
+static inline void membar(void) { __asm volatile("dmb sy" ::: "memory"); }
+
+static inline uint16_t io_canon(uint16_t off) { return canonical_io(off); }
+static inline uint32_t io_index(uint16_t off) { return (uint32_t)(io_canon(off) & 0x03ffu); }
+
+static inline void io_shadow_cpu_write(uint16_t off, uint8_t data) {
+    uint16_t a = io_canon(off);
+    uint32_t i = a & 0x03ffu;
+    /* Status/suspend addresses are command/status ports, not latches that echo
+     * the byte just written. Core0 republishes their true value. */
+    if (a >= 0x7f53u && a <= 0x7f5fu) return;
+    if (a == 0x7f48u) data &= 1u;
+    else if (a == 0x7f4cu) data &= 3u;
+    else if (a == 0x7f4eu) data &= 0x7fu;
+    else if (a == 0x7f50u) data &= 0x77u;
+    else if (a == 0x7f51u || a == 0x7f52u) data &= 1u;
+    s_io_shadow[i] = data;
+
+    /* GPR windows are mirrors of one another. Make immediate CPU readback
+     * deterministic even before core0 drains the event queue. */
+    if (a >= 0x7f80u && a <= 0x7fafu)
+        s_io_shadow[(a + 0x40u) & 0x03ffu] = data;
+    else if (a >= 0x7fc0u && a <= 0x7fefu)
+        s_io_shadow[(a - 0x40u) & 0x03ffu] = data;
+}
+
+static inline void ioq_push(uint16_t off, uint8_t data) {
+    uint32_t head = s_ioq_head;
+    uint32_t next = (head + 1u) & (CX4_IOQ_N - 1u);
+    if (next == s_ioq_tail) { s_ioq_dropped++; return; }
+    s_ioq[head].off = off;
+    s_ioq[head].data = data;
+    membar();
+    s_ioq_head = next;
+}
+
+static uint32_t ioq_drain_core0(void) {
+    uint32_t n = 0;
+    while (s_ioq_tail != s_ioq_head) {
+        uint32_t tail = s_ioq_tail;
+        membar();
+        uint16_t off = s_ioq[tail].off;
+        uint8_t data = s_ioq[tail].data;
+        s_ioq_tail = (tail + 1u) & (CX4_IOQ_N - 1u);
+        if (s_core) cx4_write(s_core, off, data);
+        uint16_t a = canonical_io(off);
+        if (a == 0x7f53u || a == 0x7f55u)
+            s_work_pending = false;  /* HALT / indefinite SUSPEND */
+        else if (write_can_start_work(off))
+            s_work_pending = true;
+        ++n;
+    }
+    return n;
+}
+
+static void publish_io_shadow_core0(void) {
+    if (!s_core) return;
+    /* Only the implemented/high-value IO range. 176 byte reads are cheap on
+     * core0 and remove all HG51B object access from the timing-critical core1. */
+    for (uint16_t a = 0x7f40u; a <= 0x7fefu; ++a)
+        s_io_shadow[a & 0x03ffu] = cx4_read(s_core, a);
+    membar();
 }
 
 static inline void core_step_master(uint32_t master_cycles) {
@@ -201,15 +279,14 @@ static inline void core_step_master(uint32_t master_cycles) {
  * execute a long DSP burst, otherwise SNES cycles would pass unanswered.
  * Core1 only records that work may have started; core0 services the LLE core
  * in the normal main loop while core1 keeps D0-D7 responsive. */
-static inline void core_note_write(uint16_t off) {
-    if (write_can_start_work(off)) s_work_pending = true;
-}
-
 static void core_reset_now(void) {
     if (!s_core) return;
     cx4_reset(s_core);
     cx4_synthesize_data_rom(s_core);
     s_master_clock += 1;
+    s_work_pending = false;
+    s_ioq_tail = s_ioq_head;
+    publish_io_shadow_core0();
     s_state_resets++;
 }
 
@@ -222,6 +299,11 @@ void cx4bus_init(void) {
     cx4_rom_slot_probe();
     s_core = s_rom_slot_valid ? cx4_create(s_game_rom, s_game_rom_size, NULL, 0) : NULL;
     if (s_core) cx4_synthesize_data_rom(s_core);
+    s_dram = s_core ? cx4_ram_ptr(s_core, 0x6000u) : NULL;
+    memset((void *)s_io_shadow, 0, sizeof(s_io_shadow));
+    s_ioq_head = s_ioq_tail = 0;
+    s_ioq_dropped = 0;
+    if (s_core) publish_io_shadow_core0();
 
     s_master_clock = 1;
     s_armed = false;
@@ -257,13 +339,9 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
          * PIO capture path. */
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
-        if (s_reset_requested) {
-            s_reset_requested = false;
-            core_reset_now();
-        }
-
+        /* Reset is also core0-owned in v0.3.4. Core1 only raises the request. */
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
-        __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
+        __asm volatile("nop; nop;" ::: "memory");
 
         uint32_t lo = sio_hw->gpio_in;
         uint32_t hi = sio_hw->gpio_hi_in;
@@ -274,13 +352,19 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             if (raw_is_cx4(lo, hi)) {
                 uint16_t off = raw_cx4_offset(lo, hi);
 
-                /* LATENCY RULE: do NOT run/sync the DSP on the SNES read path.
-                 * v0.3.2 performed 64-bit clock conversion + cx4_sync here,
-                 * delaying D0-D7 until too late in the bus cycle. Core0 owns
-                 * DSP execution; core1 only fetches the already-visible byte. */
-                uint8_t v = s_core ? cx4_read(s_core, off) : 0u;
+                /* v0.3.4: ZERO Cx4-core calls on core1. DRAM is a direct byte
+                 * lookup; IO comes from a core0-published shadow. This removes
+                 * the dual-core race and cuts physical read latency sharply. */
+                uint8_t v = 0u;
+                if (off_is_io(off)) {
+                    v = s_io_shadow[io_index(off)];
+                    s_io_reads++;
+                } else {
+                    uint32_t di = (uint32_t)(off & 0x0fffu);
+                    v = (s_dram && di < 0x0c00u) ? s_dram[di] : 0u;
+                    s_dram_reads++;
+                }
                 s_cpu_reads++;
-                if (off_is_io(off)) s_io_reads++; else s_dram_reads++;
                 s_last_read_addr = off;
                 s_last_read_data = v;
                 trace_io('R', off, v);
@@ -316,12 +400,16 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             uint8_t v = raw_data(sio_hw->gpio_in);
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
-            if (s_core) {
-                cx4_write(s_core, off, v);
-                core_note_write(off);
+            if (off_is_io(off)) {
+                io_shadow_cpu_write(off, v);
+                ioq_push(off, v);
+                s_io_writes++;
+            } else {
+                uint32_t di = (uint32_t)(off & 0x0fffu);
+                if (s_dram && di < 0x0c00u) s_dram[di] = v;
+                s_dram_writes++;
             }
             s_cpu_writes++;
-            if (off_is_io(off)) s_io_writes++; else s_dram_writes++;
             s_last_write_addr = off;
             s_last_write_data = v;
             trace_io('W', off, v);
@@ -333,17 +421,30 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
 }
 
 void cx4bus_service(void) {
-    /* Runs on core0. Keep the responder on core1 free at all times. A generous
-     * virtual slice lets the instruction-level core catch up much faster than
-     * real-time; the game simply sees RUNNING/BUSY until the computation ends. */
-    if (!s_core || !s_work_pending) return;
+    /* Core0 is the ONLY owner of HG51B IO/control mutation and execution.
+     * Core1 only updates byte-addressable DRAM and pushes IO writes. */
+    if (!s_core) return;
 
-    core_step_master(65536u);
+    if (s_reset_requested) {
+        s_reset_requested = false;
+        core_reset_now();
+    }
+
+    uint32_t drained = ioq_drain_core0();
+    if (drained) publish_io_shadow_core0();
+
+    if (!s_work_pending) return;
+
+    /* Smaller turbo slices keep queue latency low. Timed SUSPEND states MUST be
+     * allowed to consume cycles; do not clear pending merely because bit0 is 1. */
+    core_step_master(8192u);
     s_turbo_runs++;
+    publish_io_shadow_core0();
 
-    /* $7F53 mirrors status. bit0=suspended, bit6=running, bit7=busy. */
     uint8_t st = cx4_read(s_core, 0x7f53u);
-    if ((st & 0x01u) || (st & 0xc0u) == 0u) s_work_pending = false;
+    /* Stop servicing only when neither RUNNING nor BUSY is asserted. An
+     * indefinite suspend remains pending until the CPU writes RESUME ($7F5D). */
+    if ((st & 0xc0u) == 0u && (st & 0x01u) == 0u) s_work_pending = false;
 }
 
 void cx4bus_launch_core1(void) {
@@ -373,15 +474,17 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_FASTBUS_TRACE_V0.3.3 armed=%u drive=%s core1=%u core=%u "
+    printf("CX4STAT mode=LLE_SINGLE_OWNER_SHADOW_V0.3.4 armed=%u drive=%s core1=%u core=%u "
            "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
-           "cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
+           "ioq=%lu ioq_drop=%lu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
            s_core ? 1u : 0u, s_rom_slot_valid ? 1u : 0u, (unsigned long)rom_size,
            (unsigned long)s_game_rom_crc32, fw, locked,
            (unsigned long)runs, (unsigned long long)insns, (unsigned long)rdrom,
            (unsigned long long)s_turbo_runs, s_work_pending ? 1u : 0u,
+           (unsigned long)((s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u)),
+           (unsigned long)s_ioq_dropped,
            (unsigned long long)s_cpu_reads, (unsigned long long)s_cpu_writes,
            (unsigned long long)s_driven_reads,
            (unsigned long long)s_dram_reads, (unsigned long long)s_dram_writes,
