@@ -10,17 +10,19 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.4.2 EXACT-OAM SNAPSHOT + ZERO-PAD
+ * CX4 BUS v0.4.3 NO-SPECULATIVE STATE + WRITE-FORWARD
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
  * RetroPortingToolKit/snesrecomp CX4 implementation; it is not redistributed
  * in this package. The user's own game ROM is injected locally into a reserved flash slot after build.
  *
- * v0.4.2 keeps the proven active bus + PIO/DMA write path, but makes the
- * sprite-first HLE deterministic: each OAM job snapshots the 3 KiB CX4 DRAM
- * before conversion, and cartridge ROM reads use zero-padded linear ROM
- * semantics. The OAM conversion follows mature C4 HLE behavior closely.
+ * v0.4.3 fixes a concrete corruption source found on hardware: the latency-
+ * critical SIO observer no longer writes speculative samples into canonical
+ * CX4 DRAM/register state. PIO+DMA is the sole authority for persistent state.
+ * SIO provides only a short-lived read-after-write forwarding cache plus the
+ * immediate status handshake. This prevents a bad SIO address sample from
+ * permanently poisoning a second DRAM/register location.
  */
 
 #define PIN_PHI2       0u
@@ -133,6 +135,37 @@ static volatile uint64_t s_pio_writes = 0;
 static volatile uint64_t s_pio_dram_writes = 0;
 static volatile uint64_t s_pio_io_writes = 0;
 static volatile uint64_t s_sio_shadow_writes = 0;
+
+/* v0.4.3: SIO observations are never persistent state. Keep only a tiny
+ * core1-local forwarding ring so an immediate CPU read-after-write can still
+ * observe the just-written byte before PIO+DMA has reached core0. Entries
+ * expire after a handful of bus transactions. */
+#define CX4_FWD_N 16u
+#define CX4_FWD_MAX_AGE 12u
+typedef struct { uint16_t off; uint8_t data; uint8_t _pad; uint32_t seq; } cx4_fwd_t;
+static cx4_fwd_t s_fwd[CX4_FWD_N];
+static uint32_t s_fwd_head = 0;
+static uint32_t s_bus_seq = 0;
+static volatile uint64_t s_fwd_puts = 0;
+static volatile uint64_t s_fwd_hits = 0;
+static volatile uint64_t s_sio_state_blocked = 0;
+static volatile uint64_t s_hle_badparts = 0;
+
+static inline void fwd_put(uint16_t off, uint8_t data) {
+    cx4_fwd_t *e = &s_fwd[s_fwd_head++ & (CX4_FWD_N - 1u)];
+    e->off = off; e->data = data; e->seq = s_bus_seq;
+    s_fwd_puts++;
+}
+
+static inline bool fwd_get(uint16_t off, uint8_t *out) {
+    uint32_t n = s_fwd_head < CX4_FWD_N ? s_fwd_head : CX4_FWD_N;
+    for (uint32_t k = 0; k < n; ++k) {
+        const cx4_fwd_t *e = &s_fwd[(s_fwd_head - 1u - k) & (CX4_FWD_N - 1u)];
+        if ((uint32_t)(s_bus_seq - e->seq) > CX4_FWD_MAX_AGE) break;
+        if (e->off == off) { *out = e->data; s_fwd_hits++; return true; }
+    }
+    return false;
+}
 
 /* v0.4 sprite-first compatibility layer.
  * This is intentionally narrow: only the ordinary sprite/OAM build request
@@ -263,6 +296,16 @@ static bool hle_build_oam(void) {
             s_hle_rom_oor++;
         }
         if (parts > s_hle_parts_max) s_hle_parts_max = parts;
+
+        /* X2 sprite assemblies are small. 0xFF is a strong signature of a
+         * poisoned pointer/descriptor, not a plausible 255-piece object. Skip
+         * pathological assemblies instead of turning one bad descriptor into
+         * a screen full of garbage. This is only a bring-up guard; clean input
+         * should make the counter remain zero. */
+        if (parts > 64u) {
+            s_hle_badparts++;
+            continue;
+        }
 
         if (parts != 0u) {
             rp++;
@@ -642,6 +685,10 @@ void cx4bus_init(void) {
     s_ioq_dropped = 0;
     s_pio_writes = s_pio_dram_writes = s_pio_io_writes = 0;
     s_sio_shadow_writes = 0;
+    memset(s_fwd, 0, sizeof(s_fwd));
+    s_fwd_head = 0; s_bus_seq = 0;
+    s_fwd_puts = s_fwd_hits = s_sio_state_blocked = 0;
+    s_hle_badparts = 0;
     s_hle_sprite_jobs = s_hle_sprite_objects = s_hle_oam_entries = s_hle_rom_ptr_fail = 0;
     s_hle_rom_lowhalf = s_hle_rom_oor = 0;
     s_hle_zero_pad_reads = s_hle_zero_pad_ptrs = s_hle_snapshot_jobs = 0;
@@ -689,6 +736,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
 
         /* Reset is also core0-owned in v0.3.8. Core1 only raises the request. */
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
+        s_bus_seq++;
         __asm volatile("nop; nop;" ::: "memory");
 
         uint32_t lo = sio_hw->gpio_in;
@@ -706,11 +754,18 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
                 uint8_t v = 0u;
                 if (off_is_io(off)) {
                     v = s_io_shadow[io_index(off)];
-                    if (io_is_status_read(off)) v = status_apply_override(v);
+                    if (io_is_status_read(off)) {
+                        v = status_apply_override(v);
+                    } else {
+                        uint8_t fv;
+                        if (fwd_get(off, &fv)) v = fv;
+                    }
                     s_io_reads++;
                 } else {
                     uint32_t di = (uint32_t)(off & 0x0fffu);
                     v = (s_dram && di < 0x0c00u) ? s_dram[di] : 0u;
+                    uint8_t fv;
+                    if (fwd_get(off, &fv)) v = fv;
                     s_dram_reads++;
                 }
                 s_cpu_reads++;
@@ -750,18 +805,19 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
             if (off_is_io(off)) {
-                /* Fast speculative CPU-visible echo only. The LLE core is NOT
-                 * fed from this SIO sample; PIO+DMA at PHI2 falling edge is
-                 * authoritative in v0.3.8. */
-                io_shadow_cpu_write(off, v);
+                /* v0.4.3: NEVER mutate canonical IO from SIO. A bad speculative
+                 * address used to poison a second register forever. Keep only
+                 * short-lived forwarding plus the latency-critical status
+                 * handshake; PIO+DMA later commits the real register write. */
+                if (!io_is_status_read(off)) fwd_put(off, v);
                 status_on_cpu_write(off, v);
+                s_sio_state_blocked++;
                 s_sio_shadow_writes++;
                 s_io_writes++;
             } else {
-                /* Same idea for DRAM: give immediate read-after-write behaviour,
-                 * then let the PIO path overwrite with the authoritative byte. */
-                uint32_t di = (uint32_t)(off & 0x0fffu);
-                if (s_dram && di < 0x0c00u) s_dram[di] = v;
+                /* Same rule for DRAM: forward briefly, never persist. */
+                fwd_put(off, v);
+                s_sio_state_blocked++;
                 s_sio_shadow_writes++;
                 s_dram_writes++;
             }
@@ -983,9 +1039,9 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=EXACT_OAM_SNAPSHOT_ZEROPAD_V0.4.2 armed=%u drive=%s core1=%u core=%u "
-           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u hle_sprite=%u hle_jobs=%llu hle_groups=%llu hle_oam=%llu hle_romfail=%llu hle_lowhalf=%llu hle_oor=%llu hle_zpad=%llu hle_zptr=%llu hle_snap=%llu hle_pmax=%lu hle_ptr=%06lX hle_sub=%02X "
-           "ioq=%lu ioq_drop=%lu ioq_hi=%lu pio_w=%llu pio_dram=%llu pio_io=%llu sio_shadow=%llu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
+    printf("CX4STAT mode=NO_SPECULATIVE_STATE_V0.4.3 armed=%u drive=%s core1=%u core=%u "
+           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u hle_sprite=%u hle_jobs=%llu hle_groups=%llu hle_oam=%llu hle_romfail=%llu hle_lowhalf=%llu hle_oor=%llu hle_zpad=%llu hle_zptr=%llu hle_snap=%llu hle_pmax=%lu hle_badparts=%llu hle_ptr=%06lX hle_sub=%02X "
+           "fwd_put=%llu fwd_hit=%llu sio_block=%llu ioq=%lu ioq_drop=%lu ioq_hi=%lu pio_w=%llu pio_dram=%llu pio_io=%llu sio_shadow=%llu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
            s_core ? 1u : 0u, s_rom_slot_valid ? 1u : 0u, (unsigned long)rom_size,
@@ -1003,7 +1059,11 @@ void cx4bus_print_status(void) {
            (unsigned long long)s_hle_zero_pad_ptrs,
            (unsigned long long)s_hle_snapshot_jobs,
            (unsigned long)s_hle_parts_max,
+           (unsigned long long)s_hle_badparts,
            (unsigned long)s_hle_last_ptr, s_hle_last_subcmd,
+           (unsigned long long)s_fwd_puts,
+           (unsigned long long)s_fwd_hits,
+           (unsigned long long)s_sio_state_blocked,
            (unsigned long)((s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u)),
            (unsigned long)s_ioq_dropped,
            (unsigned long)s_ioq_highwater,

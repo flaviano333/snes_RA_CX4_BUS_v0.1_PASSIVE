@@ -18,12 +18,12 @@ Invoke-WebRequest -UseBasicParsing `
   -OutFile "third_party/cx4.h"
 
 py -3 tools/patch_upstream_cx4.py third_party/cx4.c
-if (Test-Path build_cx4_v032) { Remove-Item -Recurse -Force build_cx4_v032 }
-cmake -S . -B build_cx4_v032 -G Ninja
-cmake --build build_cx4_v032
+if (Test-Path build_cx4_v038) { Remove-Item -Recurse -Force build_cx4_v038 }
+cmake -S . -B build_cx4_v038 -G Ninja
+cmake --build build_cx4_v038
 
-$generic = Join-Path $root "build_cx4_v032\snes_rp2350b_capture.uf2"
-$out = Join-Path $root "build_cx4_v032\snes_rp2350b_capture_CX4_WITH_ROM.uf2"
+$generic = Join-Path $root "build_cx4_v038\snes_rp2350b_capture.uf2"
+$out = Join-Path $root "build_cx4_v038\snes_rp2350b_capture_CX4_WITH_ROM.uf2"
 py -3 tools/inject_rom_into_uf2.py "$generic" "$RomPath" -o "$out"
 Write-Host ""
 Write-Host "Pronto: $out"
