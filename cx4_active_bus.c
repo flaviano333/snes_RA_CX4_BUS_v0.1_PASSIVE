@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3.6 LLE ORDERED-JOBS + SELFTEST
+ * CX4 BUS v0.3.7 LLE STREAMING + DEEP QUEUE
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
@@ -77,14 +77,18 @@ static void cx4_rom_slot_probe(void) {
 }
 
 static Cx4 *s_core = NULL;
-/* Fast CPU-visible interface. Core1 NEVER calls cx4_read/cx4_write in v0.3.6.
+/* Fast CPU-visible interface. Core1 NEVER calls cx4_read/cx4_write in v0.3.7.
  * Core0 is the sole owner of the HG51B control/register state; core1 serves
  * the physical SNES bus from this shadow plus the core dataRAM byte array. */
 static uint8_t *s_dram = NULL;
 static volatile uint8_t s_io_shadow[0x400];
 
-typedef struct { uint16_t off; uint8_t data; } cx4_io_write_evt_t;
-#define CX4_IOQ_N 512u
+typedef struct { uint16_t off; uint16_t epoch; uint8_t data; uint8_t status_evt; } cx4_io_write_evt_t;
+#define CX4_IOQ_N 8192u
+/* Deep SPSC queue: the SNES is allowed to touch CX4 interface registers while
+ * cache/DMA/DSP work is still in flight. v0.3.7 blocked core0 until a job became
+ * idle and the old 512-entry queue overflowed, losing the very PB/PC/base writes
+ * needed by subsequent runs. */
 static volatile cx4_io_write_evt_t s_ioq[CX4_IOQ_N];
 static volatile uint32_t s_ioq_head = 0;
 static volatile uint32_t s_ioq_tail = 0;
@@ -121,6 +125,9 @@ static volatile uint64_t s_jobs_started = 0;
 static volatile uint64_t s_jobs_finished = 0;
 static volatile uint64_t s_job_chunks = 0;
 static volatile uint64_t s_job_timeouts = 0;
+static volatile uint64_t s_stream_slices = 0;
+static volatile uint64_t s_stream_master = 0;
+static volatile uint64_t s_idle_transitions = 0;
 static volatile uint32_t s_ioq_highwater = 0;
 static volatile uint64_t s_reset_vectors = 0;
 static volatile uint64_t s_state_resets = 0;
@@ -337,12 +344,21 @@ static inline void io_shadow_cpu_write(uint16_t off, uint8_t data) {
         s_io_shadow[(a - 0x40u) & 0x03ffu] = data;
 }
 
-static inline void ioq_push(uint16_t off, uint8_t data) {
+static inline bool write_changes_status(uint16_t off) {
+    uint16_t a = io_canon(off);
+    if (a == 0x7f47u || a == 0x7f48u || a == 0x7f4fu || a == 0x7f53u ||
+        (a >= 0x7f55u && a <= 0x7f5eu) || (a == 0x7f51u)) return true;
+    return false;
+}
+
+static inline void ioq_push(uint16_t off, uint8_t data, uint16_t epoch, bool status_evt) {
     uint32_t head = s_ioq_head;
     uint32_t next = (head + 1u) & (CX4_IOQ_N - 1u);
     if (next == s_ioq_tail) { s_ioq_dropped++; return; }
     s_ioq[head].off = off;
+    s_ioq[head].epoch = epoch;
     s_ioq[head].data = data;
+    s_ioq[head].status_evt = status_evt ? 1u : 0u;
     membar();
     s_ioq_head = next;
     uint32_t depth = (next - s_ioq_tail) & (CX4_IOQ_N - 1u);
@@ -354,7 +370,9 @@ static bool ioq_pop_core0(cx4_io_write_evt_t *out) {
     uint32_t tail = s_ioq_tail;
     membar();
     out->off = s_ioq[tail].off;
+    out->epoch = s_ioq[tail].epoch;
     out->data = s_ioq[tail].data;
+    out->status_evt = s_ioq[tail].status_evt;
     s_ioq_tail = (tail + 1u) & (CX4_IOQ_N - 1u);
     return true;
 }
@@ -376,24 +394,6 @@ static inline void core_step_master(uint32_t master_cycles) {
 
 static inline uint8_t core_status(void) {
     return s_core ? cx4_read(s_core, 0x7f5eu) : 0u;
-}
-
-static bool core_run_job_to_idle(void) {
-    /* Functional bring-up remains TURBO, but unlike v0.3.5 we preserve the
-     * transaction boundary: a cache/DMA/DSP launch is advanced to completion
-     * before the next queued launch is applied. This mirrors the CPU protocol,
-     * which polls bit 6/7 between jobs. */
-    const uint32_t chunk = 4096u;
-    const uint32_t max_chunks = 4096u;
-    for (uint32_t n = 0; n < max_chunks; ++n) {
-        uint8_t st = core_status();
-        if ((st & 0xc0u) == 0u) return true;
-        core_step_master(chunk);
-        s_turbo_runs++;
-        s_job_chunks++;
-    }
-    s_job_timeouts++;
-    return false;
 }
 
 /* IMPORTANT: the latency-critical bus responder runs on core1. It must never
@@ -466,7 +466,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
          * PIO capture path. */
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
-        /* Reset is also core0-owned in v0.3.6. Core1 only raises the request. */
+        /* Reset is also core0-owned in v0.3.7. Core1 only raises the request. */
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
         __asm volatile("nop; nop;" ::: "memory");
 
@@ -479,7 +479,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             if (raw_is_cx4(lo, hi)) {
                 uint16_t off = raw_cx4_offset(lo, hi);
 
-                /* v0.3.6: ZERO Cx4-core calls on core1. DRAM is a direct byte
+                /* v0.3.7: ZERO Cx4-core calls on core1. DRAM is a direct byte
                  * lookup; IO comes from a core0-published shadow. This removes
                  * the dual-core race and cuts physical read latency sharply. */
                 uint8_t v = 0u;
@@ -530,8 +530,10 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
 
             if (off_is_io(off)) {
                 io_shadow_cpu_write(off, v);
+                const bool status_evt = write_changes_status(off);
                 status_on_cpu_write(off, v);
-                ioq_push(off, v);
+                const uint16_t epoch = status_evt ? status_override_epoch() : 0u;
+                ioq_push(off, v, epoch, status_evt);
                 s_io_writes++;
             } else {
                 uint32_t di = (uint32_t)(off & 0x0fffu);
@@ -550,11 +552,13 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
 }
 
 void cx4bus_service(void) {
-    /* Core0 is the sole owner of HG51B IO/control state. v0.3.6 intentionally
-     * preserves ordering around autonomous jobs. The previous implementation
-     * drained the entire queue and only then advanced the DSP, allowing a cache
-     * launch and a later PC launch (or many repeated launches) to collapse into
-     * one state update. */
+    /* v0.3.7: STREAM the HG51B instead of blocking until a job becomes idle.
+     * Real software may touch interface registers while cache/DMA/DSP work is
+     * active. The upstream core already models whether a launch is accepted
+     * (for example $7F4F only starts when HALT is true), so the correct host
+     * behaviour is to replay every captured write in order and keep advancing
+     * the core in bounded slices. This also guarantees core1 gets frequent
+     * queue service and prevents PB/PC/base writes from being lost. */
     if (!s_core) return;
 
     if (s_reset_requested) {
@@ -562,51 +566,66 @@ void cx4bus_service(void) {
         core_reset_now();
     }
 
+    uint32_t depth = (s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u);
+    unsigned budget = depth > 4096u ? 2048u : (depth > 1024u ? 1024u : 256u);
+    bool touched = false;
     cx4_io_write_evt_t e;
-    unsigned ordinary_budget = 64u;
-    while (ordinary_budget-- && ioq_pop_core0(&e)) {
+
+    while (budget-- && ioq_pop_core0(&e)) {
         const uint16_t a = canonical_io(e.off);
-        const bool job = write_starts_job(e.off);
-        uint16_t epoch = status_override_epoch();
+        const bool launch = write_starts_job(e.off);
+        if (launch) s_jobs_started++;
 
-        if (job) {
-            /* Reinforce the immediate core1 handshake at the exact point this
-             * queued transaction becomes the next HG51B operation. */
-            uint8_t bits = job_status_bits(e.off);
-            uint8_t mask = job_status_mask(e.off);
-            status_override_update(mask, bits);
-            epoch = status_override_epoch();
-            s_jobs_started++;
-        }
-
+        /* The core itself decides if the operation is legal in the current
+         * HALT/cache/DMA state. Do not artificially wait for a previous job. */
         cx4_write(s_core, e.off, e.data);
+        touched = true;
 
-        /* Command/status ports do not echo writes, so republish their true
-         * value promptly. Normal latches already have immediate core1 shadow. */
-        if (job || (a >= 0x7f53u && a <= 0x7f5fu))
-            publish_io_shadow_core0();
-
-        if (job) {
+        if (launch) {
             s_work_pending = true;
-            const bool done = core_run_job_to_idle();
-            publish_io_shadow_core0();
-            if (done) {
-                s_jobs_finished++;
-                s_work_pending = false;
-                if (a == 0x7f4fu) s_halt_shadow = true;
-            }
-            /* Clear only this launch's override. If core1 observed a newer
-             * status-changing transaction meanwhile, epoch protection leaves
-             * that newer handshake intact for its own queued job. */
-            status_override_ack_if_unchanged(epoch);
-
-            /* A job is a hard ordering boundary. Return to the main loop after
-             * one launch so USB/RA work remains responsive and the SNES keeps
-             * seeing the completed status before another launch is consumed. */
-            break;
+            if (a == 0x7f4fu) s_halt_shadow = false;
+        }
+        if (a == 0x7f53u) {
+            s_halt_shadow = true;
+            s_work_pending = false;
+        } else if (a == 0x7f5du) {
+            s_work_pending = true;
         }
 
-        if (a == 0x7f53u || a == 0x7f55u) s_work_pending = false;
+        /* Once the write has reached the single-owner core, its true status can
+         * replace the immediate core1 handshake. Epoch matching prevents an
+         * older event from clearing a newer status override. */
+        if (e.status_evt) {
+            publish_io_shadow_core0();
+            status_override_ack_if_unchanged(e.epoch);
+        }
+    }
+
+    if (touched) publish_io_shadow_core0();
+
+    uint8_t st = core_status();
+    if ((st & 0xc0u) || (st & 0x01u)) s_work_pending = true;
+
+    if (s_work_pending) {
+        /* Keep slices short while the queue has traffic; turbo harder only when
+         * core1 has nothing waiting. This is functional/timing bring-up, not yet
+         * cycle-perfect 20 MHz scheduling. */
+        depth = (s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u);
+        uint32_t slice = depth ? 256u : 4096u;
+        core_step_master(slice);
+        s_turbo_runs++;
+        s_job_chunks++;
+        s_stream_slices++;
+        s_stream_master += slice;
+        publish_io_shadow_core0();
+
+        st = core_status();
+        if ((st & 0xc0u) == 0u && (st & 0x01u) == 0u) {
+            s_work_pending = false;
+            s_halt_shadow = true;
+            s_jobs_finished++;
+            s_idle_transitions++;
+        }
     }
 }
 
@@ -699,9 +718,9 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_ORDERED_JOBS_SELFTEST_V0.3.6 armed=%u drive=%s core1=%u core=%u "
+    printf("CX4STAT mode=LLE_STREAMING_DEEP_QUEUE_V0.3.7 armed=%u drive=%s core1=%u core=%u "
            "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
-           "ioq=%lu ioq_drop=%lu ioq_hi=%lu jobs=%llu/%llu job_chunks=%llu job_to=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
+           "ioq=%lu ioq_drop=%lu ioq_hi=%lu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
            s_core ? 1u : 0u, s_rom_slot_valid ? 1u : 0u, (unsigned long)rom_size,
@@ -715,6 +734,9 @@ void cx4bus_print_status(void) {
            (unsigned long long)s_jobs_finished,
            (unsigned long long)s_job_chunks,
            (unsigned long long)s_job_timeouts,
+           (unsigned long long)s_stream_slices,
+           (unsigned long long)s_stream_master,
+           (unsigned long long)s_idle_transitions,
            s_halt_shadow ? 1u : 0u,
            (unsigned long)(__atomic_load_n(&s_status_override, __ATOMIC_ACQUIRE) & 0xffffu),
            (unsigned long long)s_status_override_sets,

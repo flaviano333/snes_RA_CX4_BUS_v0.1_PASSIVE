@@ -9,7 +9,7 @@ pico_sdk_init()
 
 if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.c" OR
    NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.h")
-  message(FATAL_ERROR "CX4 LLE ausente. Rode PREPARAR_E_COMPILAR_CX4_v0.3.6.ps1 ou use o GitHub Actions desta versao.")
+  message(FATAL_ERROR "CX4 LLE ausente. Rode PREPARAR_E_COMPILAR_CX4_v0.3.7.ps1 ou use o GitHub Actions desta versao.")
 endif()
 
 add_executable(snes_rp2350b_capture

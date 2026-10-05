@@ -1224,7 +1224,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + CX4 BUS v0.3.6 LLE ORDERED-JOBS + SELFTEST ===\n");
+    printf("\n=== SNES RP2350B RA + CX4 BUS v0.3.7 LLE STREAMING + DEEP QUEUE ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
@@ -1360,7 +1360,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.3.6 ORDERED-JOBS + SELFTEST available; drive starts OFF.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.3.7 STREAMING + DEEP QUEUE available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
@@ -1407,6 +1407,9 @@ int main(void) {
     uint read_buf = 0;
 
     while (true) {
+        // CX4 gets first priority on core0; never let RA batch decoding starve the coprocessor queue.
+        cx4bus_service();
+
         // v1.6: when a pair fills, switch DMA to the other buffer immediately.
         // PIO remains enabled, so its FIFO only has to cover the few register writes
         // needed to rearm DMA instead of the entire software decoding loop.
@@ -1424,8 +1427,10 @@ int main(void) {
             write_buf = next;
             cx4_active_write_buf = next;
 
-            // Decode the completed buffer while hardware fills the alternate one.
+            // Service CX4 before/after the comparatively heavy RA mirror decode.
+            cx4bus_service();
             process_write_batch(low_samples[done], high_samples[done]);
+            cx4bus_service();
         }
 
         if (dma_remaining(dma_read_lo) == 0 && dma_remaining(dma_read_hi) == 0) {
@@ -1440,7 +1445,9 @@ int main(void) {
             read_buf = next;
             cx4_active_read_buf = next;
 
+            cx4bus_service();
             process_read_batch(read_low_samples[done], read_high_samples[done]);
+            cx4bus_service();
         }
 
         cx4bus_service();
