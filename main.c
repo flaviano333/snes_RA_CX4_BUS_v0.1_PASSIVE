@@ -32,7 +32,7 @@
 #define CMD_BUF_SIZE   4096
 #define DEBUG_MAX_LINES 4096u
 
-// CX4 BUS v0.1.1 passive qualification layer. No GPIO is driven yet.
+// CX4 BUS v0.3 LLE layer. No GPIO is driven yet.
 // Adds non-destructive inspection of the currently filling DMA buffers so CX4STAT
 // no longer has to wait for a complete 1024-sample batch.
 // This first build proves address decode/reset-vector observation while preserving RA v2.0.
@@ -1215,7 +1215,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + CX4 BUS v0.2 ACTIVE SELFTEST ===\n");
+    printf("\n=== SNES RP2350B RA + CX4 BUS v0.3 LLE ROM-EMBED TURBO ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
@@ -1351,7 +1351,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.2 active interface available; drive starts OFF.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.3 LLE available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
@@ -1434,6 +1434,7 @@ int main(void) {
             process_read_batch(read_low_samples[done], read_high_samples[done]);
         }
 
+        cx4bus_service();
         poll_serial_commands();
 
         tight_loop_contents();

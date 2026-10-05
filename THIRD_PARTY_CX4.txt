@@ -1,0 +1,15 @@
+CX4 LLE CORE
+============
+Este pacote NAO redistribui o codigo de terceiros.
+
+PREPARAR_E_COMPILAR_CX4_v0.3.ps1 baixa no computador do usuario:
+  https://github.com/RetroPortingToolKit/snesrecomp
+  runner/src/snes/cx4.c
+  runner/src/snes/cx4.h
+
+Esse core declara ser portado do ares sob licenca ISC/permissiva. Consulte o
+repositorio upstream e seus arquivos de atribuicao/licenca antes de redistribuir
+uma build ou o fonte combinado.
+
+A ROM de Mega Man X2/X3 nao e fornecida por este projeto. O script usa somente
+o arquivo indicado pelo proprio usuario.

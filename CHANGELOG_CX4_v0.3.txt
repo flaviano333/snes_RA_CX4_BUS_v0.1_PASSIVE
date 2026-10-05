@@ -1,0 +1,11 @@
+CX4 BUS v0.3 - LLE ROM-EMBED TURBO
+===================================
+- Substitui o stub de DSP da v0.2 por um core HG51B S169/CX4 instruction-level.
+- O core permissivo e obtido do upstream no momento do build, nao redistribuido.
+- ROM do usuario e incorporada localmente ao firmware para as leituras internas
+  que o CX4 real faria no cartucho.
+- ROM matematica interna 1024x24 e sintetizada pelo core.
+- Mantem responder ativo D0-D7 e toda a camada RA v2.0 READ-REPAIR.
+- Primeiro modo de execucao: TURBO-to-idle para validar funcionalidade antes do
+  refinamento exato de 20 MHz/status busy.
+- CX4STAT adiciona runs, insns, rdrom, firmware e locked.
