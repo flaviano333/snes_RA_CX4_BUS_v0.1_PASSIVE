@@ -1,0 +1,35 @@
+TESTE RAPIDO v0.3.5 - FAST STATUS HANDSHAKE
+
+1. Gere o UF2 no GitHub Actions e injete sua ROM localmente.
+2. Grave *_COM_ROM.uf2.
+3. No terminal: CX4STAT, CX4RESET, CX4ARM.
+4. Reset no SNES.
+5. Se travar ou apresentar artefatos: CX4STAT e CX4TRACE.
+
+O trace-chave esperado mudou:
+- depois de W 7F48 xx, leituras de 7F5E devem mostrar C0 enquanto CACHE esta ocupado, e depois 00;
+- depois de W 7F4F xx, leituras de 7F5E devem mostrar 40 durante RUNNING, e depois 00 no HALT.
+
+Campos novos:
+stat_ovr      override CPU-visivel ainda pendente (mask/value empacotados)
+stat_set      quantas mudancas imediatas de status foram publicadas pelo core1
+stat_forced_r quantas leituras de status precisaram do handshake rapido
+
+Se stat_forced_r > 0, o bug visto na v0.3.4 foi efetivamente interceptado.
+ioq_drop deve continuar 0.
+
+TESTE RAPIDO v0.3.5
+
+1. Build generic UF2 in GitHub Actions.
+2. Inject your own Mega Man X2 ROM with INJETAR_ROM_NO_UF2.bat.
+3. Flash *_COM_ROM.uf2.
+4. Start with CX4STAT. Verify core=1 rom_slot=1 firmware=1.
+5. CX4RESET
+6. CX4ARM
+7. Reset SNES and run the built-in CX4 test.
+8. If it freezes, run CX4STAT then CX4TRACE.
+
+Important fields:
+- ioq_drop must be 0.
+- runs/insns/rdrom should increase after $7F4F starts.
+- A much smaller instruction count than v0.3.3 is expected if the runaway/race was fixed.

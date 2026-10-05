@@ -1,4 +1,4 @@
-CX4 BUS v0.3.4 - SINGLE-OWNER SHADOW
+CX4 BUS v0.3.5 - FAST-STATUS HANDSHAKE
 
 - Core1 no longer calls cx4_read/cx4_write.
 - Core0 is the sole owner of HG51B IO/control state and execution.

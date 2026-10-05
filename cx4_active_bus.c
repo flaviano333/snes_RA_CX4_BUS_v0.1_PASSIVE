@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3.4 LLE SINGLE-OWNER SHADOW
+ * CX4 BUS v0.3.5 LLE FAST-STATUS HANDSHAKE
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
@@ -77,7 +77,7 @@ static void cx4_rom_slot_probe(void) {
 }
 
 static Cx4 *s_core = NULL;
-/* Fast CPU-visible interface. Core1 NEVER calls cx4_read/cx4_write in v0.3.4.
+/* Fast CPU-visible interface. Core1 NEVER calls cx4_read/cx4_write in v0.3.5.
  * Core0 is the sole owner of the HG51B control/register state; core1 serves
  * the physical SNES bus from this shadow plus the core dataRAM byte array. */
 static uint8_t *s_dram = NULL;
@@ -95,6 +95,15 @@ static volatile bool s_driving = false;
 static volatile bool s_reset_requested = false;
 static volatile bool s_work_pending = false;
 static volatile uint8_t s_reset_arm = 0;
+
+/* CPU-visible status must change immediately when the SNES starts cache/DMA/DSP.
+ * In v0.3.5 these bits were only published after core0 drained the IO queue, so
+ * MMX2 could read $7F5E=00 immediately after $7F48/$7F4F and incorrectly assume
+ * the operation had already finished. Pack value/mask/epoch into one atomic word:
+ * bits 0..7=value, 8..15=mask, 16..31=epoch. */
+static volatile uint32_t s_status_override = 0;
+static volatile uint64_t s_status_override_sets = 0;
+static volatile uint64_t s_status_forced_reads = 0;
 
 static uint64_t s_master_clock = 1;
 
@@ -210,6 +219,82 @@ static inline void membar(void) { __asm volatile("dmb sy" ::: "memory"); }
 static inline uint16_t io_canon(uint16_t off) { return canonical_io(off); }
 static inline uint32_t io_index(uint16_t off) { return (uint32_t)(io_canon(off) & 0x03ffu); }
 
+static inline bool io_is_status_read(uint16_t off) {
+    switch (io_canon(off)) {
+        case 0x7f53u: case 0x7f54u: case 0x7f55u: case 0x7f56u:
+        case 0x7f57u: case 0x7f59u: case 0x7f5bu: case 0x7f5cu:
+        case 0x7f5du: case 0x7f5eu: case 0x7f5fu:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline uint8_t status_apply_override(uint8_t base) {
+    uint32_t p = __atomic_load_n(&s_status_override, __ATOMIC_ACQUIRE);
+    uint8_t value = (uint8_t)(p & 0xffu);
+    uint8_t mask = (uint8_t)((p >> 8) & 0xffu);
+    if (mask) s_status_forced_reads++;
+    return (uint8_t)((base & (uint8_t)~mask) | (value & mask));
+}
+
+static inline uint8_t status_effective_now(void) {
+    uint8_t base = s_io_shadow[0x353u]; /* canonical $7F53 */
+    uint32_t p = __atomic_load_n(&s_status_override, __ATOMIC_ACQUIRE);
+    uint8_t value = (uint8_t)(p & 0xffu);
+    uint8_t mask = (uint8_t)((p >> 8) & 0xffu);
+    return (uint8_t)((base & (uint8_t)~mask) | (value & mask));
+}
+
+static void status_override_update(uint8_t mask, uint8_t value) {
+    uint32_t oldv, newv;
+    do {
+        oldv = __atomic_load_n(&s_status_override, __ATOMIC_ACQUIRE);
+        uint8_t old_value = (uint8_t)(oldv & 0xffu);
+        uint8_t old_mask = (uint8_t)((oldv >> 8) & 0xffu);
+        uint16_t epoch = (uint16_t)((oldv >> 16) + 1u);
+        uint8_t new_mask = (uint8_t)(old_mask | mask);
+        uint8_t new_value = (uint8_t)((old_value & (uint8_t)~mask) | (value & mask));
+        newv = (uint32_t)new_value | ((uint32_t)new_mask << 8) | ((uint32_t)epoch << 16);
+    } while (!__atomic_compare_exchange_n(&s_status_override, &oldv, newv, false,
+                                           __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+    s_status_override_sets++;
+}
+
+static inline uint16_t status_override_epoch(void) {
+    return (uint16_t)(__atomic_load_n(&s_status_override, __ATOMIC_ACQUIRE) >> 16);
+}
+
+static void status_override_ack_if_unchanged(uint16_t epoch) {
+    uint32_t oldv = __atomic_load_n(&s_status_override, __ATOMIC_ACQUIRE);
+    if ((uint16_t)(oldv >> 16) != epoch) return;
+    uint32_t desired = oldv & 0xffff0000u; /* preserve epoch, clear value+mask */
+    (void)__atomic_compare_exchange_n(&s_status_override, &oldv, desired, false,
+                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+static void status_on_cpu_write(uint16_t off, uint8_t data) {
+    uint16_t a = io_canon(off);
+    uint8_t st = status_effective_now();
+    bool halted = (st & 0x40u) == 0u;
+
+    if ((a == 0x7f47u || a == 0x7f48u) && halted) {
+        /* Cache fill / DMA: both RUNNING and BUSY become visible immediately. */
+        status_override_update(0xc0u, 0xc0u);
+    } else if (a == 0x7f4fu && halted) {
+        /* Program execution: RUNNING immediately; BUSY is only cache/DMA/bus. */
+        status_override_update(0xc0u, 0x40u);
+    } else if (a == 0x7f53u) {
+        status_override_update(0xc0u, 0x00u);
+    } else if (a >= 0x7f55u && a <= 0x7f5cu) {
+        status_override_update(0x01u, 0x01u);
+    } else if (a == 0x7f5du) {
+        status_override_update(0x01u, 0x00u);
+    } else if (a == 0x7f5eu || (a == 0x7f51u && (data & 1u))) {
+        status_override_update(0x02u, 0x00u);
+    }
+}
+
 static inline void io_shadow_cpu_write(uint16_t off, uint8_t data) {
     uint16_t a = io_canon(off);
     uint32_t i = a & 0x03ffu;
@@ -286,6 +371,7 @@ static void core_reset_now(void) {
     s_master_clock += 1;
     s_work_pending = false;
     s_ioq_tail = s_ioq_head;
+    __atomic_store_n(&s_status_override, 0u, __ATOMIC_RELEASE);
     publish_io_shadow_core0();
     s_state_resets++;
 }
@@ -310,6 +396,9 @@ void cx4bus_init(void) {
     s_driving = false;
     s_reset_requested = false;
     s_work_pending = false;
+    __atomic_store_n(&s_status_override, 0u, __ATOMIC_RELEASE);
+    s_status_override_sets = 0;
+    s_status_forced_reads = 0;
     s_state_resets = s_core ? 1 : 0;
 
     const uint pins[8] = {2,3,4,6,7,8,9,10};
@@ -339,7 +428,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
          * PIO capture path. */
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
-        /* Reset is also core0-owned in v0.3.4. Core1 only raises the request. */
+        /* Reset is also core0-owned in v0.3.5. Core1 only raises the request. */
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
         __asm volatile("nop; nop;" ::: "memory");
 
@@ -352,12 +441,13 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             if (raw_is_cx4(lo, hi)) {
                 uint16_t off = raw_cx4_offset(lo, hi);
 
-                /* v0.3.4: ZERO Cx4-core calls on core1. DRAM is a direct byte
+                /* v0.3.5: ZERO Cx4-core calls on core1. DRAM is a direct byte
                  * lookup; IO comes from a core0-published shadow. This removes
                  * the dual-core race and cuts physical read latency sharply. */
                 uint8_t v = 0u;
                 if (off_is_io(off)) {
                     v = s_io_shadow[io_index(off)];
+                    if (io_is_status_read(off)) v = status_apply_override(v);
                     s_io_reads++;
                 } else {
                     uint32_t di = (uint32_t)(off & 0x0fffu);
@@ -402,6 +492,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
 
             if (off_is_io(off)) {
                 io_shadow_cpu_write(off, v);
+                status_on_cpu_write(off, v);
                 ioq_push(off, v);
                 s_io_writes++;
             } else {
@@ -430,21 +521,32 @@ void cx4bus_service(void) {
         core_reset_now();
     }
 
+    /* Snapshot the status-override epoch. If core1 receives another status-
+     * changing write while we service this batch, the compare-exchange below
+     * will deliberately leave that newer override in place. */
+    uint16_t status_epoch = status_override_epoch();
+    bool published = false;
+
     uint32_t drained = ioq_drain_core0();
-    if (drained) publish_io_shadow_core0();
+    if (drained) {
+        publish_io_shadow_core0();
+        published = true;
+    }
 
-    if (!s_work_pending) return;
+    if (s_work_pending) {
+        /* Turbo-to-idle remains intentional for functional bring-up. Crucially,
+         * the SNES now sees BUSY/RUNNING immediately and waits while these slices
+         * execute, rather than racing ahead before core0 drains $7F48/$7F4F. */
+        core_step_master(8192u);
+        s_turbo_runs++;
+        publish_io_shadow_core0();
+        published = true;
 
-    /* Smaller turbo slices keep queue latency low. Timed SUSPEND states MUST be
-     * allowed to consume cycles; do not clear pending merely because bit0 is 1. */
-    core_step_master(8192u);
-    s_turbo_runs++;
-    publish_io_shadow_core0();
+        uint8_t st = cx4_read(s_core, 0x7f53u);
+        if ((st & 0xc0u) == 0u && (st & 0x01u) == 0u) s_work_pending = false;
+    }
 
-    uint8_t st = cx4_read(s_core, 0x7f53u);
-    /* Stop servicing only when neither RUNNING nor BUSY is asserted. An
-     * indefinite suspend remains pending until the CPU writes RESUME ($7F5D). */
-    if ((st & 0xc0u) == 0u && (st & 0x01u) == 0u) s_work_pending = false;
+    if (published) status_override_ack_if_unchanged(status_epoch);
 }
 
 void cx4bus_launch_core1(void) {
@@ -474,9 +576,9 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_SINGLE_OWNER_SHADOW_V0.3.4 armed=%u drive=%s core1=%u core=%u "
+    printf("CX4STAT mode=LLE_FAST_STATUS_HANDSHAKE_V0.3.5 armed=%u drive=%s core1=%u core=%u "
            "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
-           "ioq=%lu ioq_drop=%lu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
+           "ioq=%lu ioq_drop=%lu stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
            s_core ? 1u : 0u, s_rom_slot_valid ? 1u : 0u, (unsigned long)rom_size,
@@ -485,6 +587,9 @@ void cx4bus_print_status(void) {
            (unsigned long long)s_turbo_runs, s_work_pending ? 1u : 0u,
            (unsigned long)((s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u)),
            (unsigned long)s_ioq_dropped,
+           (unsigned long)(__atomic_load_n(&s_status_override, __ATOMIC_ACQUIRE) & 0xffffu),
+           (unsigned long long)s_status_override_sets,
+           (unsigned long long)s_status_forced_reads,
            (unsigned long long)s_cpu_reads, (unsigned long long)s_cpu_writes,
            (unsigned long long)s_driven_reads,
            (unsigned long long)s_dram_reads, (unsigned long long)s_dram_writes,

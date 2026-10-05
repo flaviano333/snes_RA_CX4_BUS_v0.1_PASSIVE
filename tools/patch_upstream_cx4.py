@@ -144,4 +144,4 @@ if missing:
     raise SystemExit("API CX4 upstream incompativel; faltando: " + ", ".join(missing))
 
 p.write_text(s, encoding="utf-8", newline="\n")
-print("Core CX4 upstream adaptado para bare metal (patch estrutural v0.3.4).")
+print("Core CX4 upstream adaptado para bare metal (patch estrutural v0.3.5).")
