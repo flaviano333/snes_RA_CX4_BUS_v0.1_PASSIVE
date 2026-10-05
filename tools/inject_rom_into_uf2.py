@@ -67,7 +67,7 @@ def make_rom_blocks(rom: bytes, flags: int, family: int):
 
 
 def main():
-    ap=argparse.ArgumentParser(description='Injeta a ROM local do Mega Man X2/X3 em um UF2 generico CX4 v0.3.3.')
+    ap=argparse.ArgumentParser(description='Injeta a ROM local do Mega Man X2/X3 em um UF2 generico CX4 v0.5.')
     ap.add_argument('base_uf2', type=Path)
     ap.add_argument('rom', type=Path)
     ap.add_argument('-o','--output', type=Path)
