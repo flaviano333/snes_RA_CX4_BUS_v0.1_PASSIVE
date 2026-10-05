@@ -10,19 +10,18 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.4 SPRITE-FIRST HLE + LLE FALLBACK
+ * CX4 BUS v0.4.1 SPRITE ROM-MAP FIX + LLE FALLBACK
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
  * RetroPortingToolKit/snesrecomp CX4 implementation; it is not redistributed
  * in this package. The user's own game ROM is injected locally into a reserved flash slot after build.
  *
- * v0.4 keeps the proven active bus + PIO/DMA write path, but adds a narrow
- * compatibility HLE for the runtime sprite-OAM job used heavily by Mega Man X2.
- * The boot/self-test remains on the permissive LLE core. When the CPU writes
- * PC=$00 with sprite subcommand $00, the RP2350 builds the OAM result directly
- * from CX4 interface RAM and the user-injected LoROM image. This intentionally
- * prioritizes visible gameplay sprites over making the diagnostic ROM perfect.
+ * v0.4.1 keeps the proven active bus + PIO/DMA write path and fixes the
+ * runtime sprite-OAM HLE ROM pointer mapping to match the CX4/Snes9x mapping.
+ * The boot/self-test remains on the permissive LLE core. Runtime OAM building
+ * accepts both high-half and low-half 16-bit addresses exactly as the CX4 ROM
+ * pointer mapping does; the previous v0.4 incorrectly rejected addr<$8000.
  */
 
 #define PIN_PHI2       0u
@@ -145,6 +144,8 @@ static volatile uint64_t s_hle_sprite_jobs = 0;
 static volatile uint64_t s_hle_sprite_objects = 0;
 static volatile uint64_t s_hle_oam_entries = 0;
 static volatile uint64_t s_hle_rom_ptr_fail = 0;
+static volatile uint64_t s_hle_rom_lowhalf = 0;
+static volatile uint64_t s_hle_rom_oor = 0;
 static volatile uint32_t s_hle_last_ptr = 0;
 static volatile uint8_t s_hle_last_subcmd = 0xffu;
 
@@ -180,16 +181,20 @@ static inline uint32_t hle_ram24(uint16_t i) {
            ((uint32_t)hle_ram_get((uint16_t)(i + 2u)) << 16);
 }
 
-/* Mega Man X2 is LoROM. Convert a 24-bit SNES ROM pointer to the local ROM
- * image injected at 4 MiB. We reject low-half addresses instead of guessing;
- * a bad pointer is safer as a visible diagnostic than an out-of-range read. */
+/* CX4 cartridge-ROM pointer mapping. This intentionally matches the mapping
+ * used by mature CX4 emulation: ((addr & $ff0000) >> 1) + (addr & $7fff).
+ * Important: the 16-bit address is NOT required to be >= $8000. CX4 sprite
+ * descriptors legitimately use low-half aliases; v0.4 rejected those and
+ * therefore discarded most sprite assemblies. */
 static bool hle_lorom_ptr(uint32_t snes_addr, uint32_t need, const uint8_t **out) {
     if (!s_rom_slot_valid || !s_game_rom || !s_game_rom_size) return false;
-    uint8_t bank = (uint8_t)(snes_addr >> 16);
     uint16_t addr = (uint16_t)snes_addr;
-    if (addr < 0x8000u) return false;
-    uint32_t off = ((uint32_t)(bank & 0x7fu) << 15) | (uint32_t)(addr & 0x7fffu);
-    if (off >= s_game_rom_size || need > s_game_rom_size - off) return false;
+    if (addr < 0x8000u) s_hle_rom_lowhalf++;
+    uint32_t off = ((snes_addr & 0xff0000u) >> 1) + (snes_addr & 0x7fffu);
+    if (off >= s_game_rom_size || need > s_game_rom_size - off) {
+        s_hle_rom_oor++;
+        return false;
+    }
     *out = s_game_rom + off;
     return true;
 }
@@ -615,6 +620,7 @@ void cx4bus_init(void) {
     s_pio_writes = s_pio_dram_writes = s_pio_io_writes = 0;
     s_sio_shadow_writes = 0;
     s_hle_sprite_jobs = s_hle_sprite_objects = s_hle_oam_entries = s_hle_rom_ptr_fail = 0;
+    s_hle_rom_lowhalf = s_hle_rom_oor = 0;
     s_hle_last_ptr = 0; s_hle_last_subcmd = 0xffu;
     if (s_core) publish_io_shadow_core0();
 
@@ -952,8 +958,8 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=SPRITE_FIRST_HLE_V0.4 armed=%u drive=%s core1=%u core=%u "
-           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u hle_sprite=%u hle_jobs=%llu hle_groups=%llu hle_oam=%llu hle_romfail=%llu hle_ptr=%06lX hle_sub=%02X "
+    printf("CX4STAT mode=SPRITE_ROMMAP_FIX_V0.4.1 armed=%u drive=%s core1=%u core=%u "
+           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u hle_sprite=%u hle_jobs=%llu hle_groups=%llu hle_oam=%llu hle_romfail=%llu hle_lowhalf=%llu hle_oor=%llu hle_ptr=%06lX hle_sub=%02X "
            "ioq=%lu ioq_drop=%lu ioq_hi=%lu pio_w=%llu pio_dram=%llu pio_io=%llu sio_shadow=%llu jobs=%llu/%llu job_chunks=%llu job_to=%llu stream=%llu master=%llu idle=%llu halt_sh=%u stat_ovr=%04lX stat_set=%llu stat_forced_r=%llu cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
@@ -966,6 +972,8 @@ void cx4bus_print_status(void) {
            (unsigned long long)s_hle_sprite_objects,
            (unsigned long long)s_hle_oam_entries,
            (unsigned long long)s_hle_rom_ptr_fail,
+           (unsigned long long)s_hle_rom_lowhalf,
+           (unsigned long long)s_hle_rom_oor,
            (unsigned long)s_hle_last_ptr, s_hle_last_subcmd,
            (unsigned long)((s_ioq_head - s_ioq_tail) & (CX4_IOQ_N - 1u)),
            (unsigned long)s_ioq_dropped,

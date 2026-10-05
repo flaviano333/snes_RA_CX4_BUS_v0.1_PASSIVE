@@ -1,0 +1,18 @@
+TESTE CX4 v0.4.1
+
+1. Injete sua ROM no UF2 v0.4.1 e grave o arquivo _COM_ROM.uf2.
+2. Ligue o SNES/Flash Master e abra o terminal serial.
+3. Rode CX4SELF. Deve continuar em 21704 insns / 1024 rdrom / 1024 distinct.
+4. Rode CX4RESET.
+5. Rode CX4ARM.
+6. Rode CX4STAT e CONFIRME: armed=1. drive=OFF parado e normal.
+7. Aperte RESET no SNES.
+8. Entre no jogo e observe os sprites.
+9. Rode CX4STAT. Durante o jogo driven deve ser >0.
+10. Envie CX4STAT + CX4TRACE.
+
+Campos novos:
+  hle_lowhalf = ponteiros de sprite validos que usam addr<$8000.
+  hle_oor     = ponteiros cujo offset calculado caiu fora da ROM injetada.
+
+O resultado desejado e hle_oam subindo, hle_oor baixo e driven>0.

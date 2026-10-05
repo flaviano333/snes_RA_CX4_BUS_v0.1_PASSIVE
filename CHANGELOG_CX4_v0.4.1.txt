@@ -1,0 +1,9 @@
+CX4 BUS v0.4.1 - SPRITE ROM-MAP FIX
+
+- Corrige o mapeamento dos ponteiros de ROM usados pelo HLE de sprites.
+- v0.4 rejeitava qualquer ponteiro com addr<$8000; isso estava errado.
+- Agora usa a mesma formula de mapeamento do CX4: ((A & 0xFF0000)>>1) + (A & 0x7FFF).
+- Mantem o HLE de OAM e o LLE como fallback.
+- Novos contadores: hle_lowhalf e hle_oor.
+- IMPORTANTE: o responder continua iniciando DISARMED. Execute CX4RESET, CX4ARM e so entao RESET no SNES.
+- Se armed=0 ou driven=0, o SNES nao esta recebendo nenhum byte do CX4 virtual.
