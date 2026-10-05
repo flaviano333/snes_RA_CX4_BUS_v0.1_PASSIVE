@@ -1,0 +1,94 @@
+CX4 BUS v0.2 ACTIVE SELFTEST
+============================
+
+OBJETIVO
+--------
+Esta e a primeira build que faz o RP2350B RESPONDER ao SNES como dispositivo
+na janela externa do Capcom CX4. Ela foi feita para o seu Flash Master sem CX4
+fisico. Nao use esta build ativa em paralelo com um cartucho que tenha CX4 real
+respondendo no mesmo barramento.
+
+A v0.2 ainda NAO executa o processador HG51B S169. Ela implementa apenas a
+interface externa que a CPU do SNES enxerga:
+
+- 3 KiB Data RAM em $6000-$6BFF
+- mirror em $7000-$7BFF
+- IO em $6C00-$6FFF e $7C00-$7FFF
+- registradores $7F40-$7F5F
+- vector/interface RAM $7F60-$7F7F
+- R0-R15 em $7F80-$7FAF e mirror $7FC0-$7FEF
+
+Isso permite usar o autoteste de Mega Man X2 como instrumento de bring-up.
+Esperado: alguns dos primeiros testes podem passar, enquanto Immediate ROM e
+operacoes que exigem execucao real do HG51B ainda devem falhar.
+
+SEGURANCA / ARMAMENTO
+---------------------
+O firmware SEMPRE inicia com:
+
+    armed=0
+    drive=OFF
+
+Assim D0-D7 ficam INPUT e o comportamento e passivo como antes.
+
+Para ativar a resposta:
+
+1. Ligue o RP2350B e abra a serial.
+2. Confirme com:
+
+    CX4STAT
+
+3. Envie:
+
+    CX4ARM
+
+4. So entao aperte RESET no SNES para Mega Man X2 refazer o autoteste.
+
+Para soltar o barramento imediatamente:
+
+    CX4DISARM
+
+Para zerar somente o estado virtual do CX4:
+
+    CX4RESET
+
+IMPORTANTE: esta build assume a decisao experimental de usar D0-D7 diretamente
+entre SNES e RP2350B, sem transceiver externo. Os GPIOs so viram OUTPUT durante
+uma leitura decodificada como CX4 e voltam para INPUT no falling edge de PHI2.
+
+SEM FIO DE /RESET
+-----------------
+Core1 tambem observa o vetor $00:FFFC/$00:FFFD e tenta resetar o estado virtual
+automaticamente. O comando CX4RESET continua existindo como fallback.
+
+COMO TESTAR
+-----------
+Com o Mega Man X2 no Flash Master:
+
+    CX4STAT
+    CX4ARM
+
+Aperte RESET no SNES e observe a tela de diagnostico do jogo.
+Depois consulte:
+
+    CX4STAT
+
+Procure:
+
+- driven > 0       : RP respondeu leituras CX4
+- dram_r/dram_w    : Data RAM bidirecional
+- io_r/io_w        : registradores bidirecionais
+- starts > 0       : escrita em $7F4F observada
+- vec_resets > 0   : reset inferido sem fio extra
+
+Se a tela mudar de ERROR para OK em Interface Register / Register File / Data RAM,
+a parte eletrica + timing do responder esta validada. O passo seguinte sera portar
+o core HG51B/CX4 de baixo nivel e fornecer acesso a ROM de referencia do usuario.
+
+FIAÇÃO
+------
+Nenhum fio novo em relacao a montagem atual.
+
+D0-D7 continuam nos mesmos GPIOs. A mudanca e de firmware: durante leitura CX4,
+core1 pre-carrega o byte nos GPIOs e habilita OE; no falling edge de PHI2, OE e
+desabilitado novamente.

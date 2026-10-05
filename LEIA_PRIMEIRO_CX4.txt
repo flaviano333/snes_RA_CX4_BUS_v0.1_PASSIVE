@@ -1,38 +1,16 @@
-SNES RP2350B RA + CX4 BUS v0.1 PASSIVE
-=======================================
+LEIA PRIMEIRO - CX4 BUS v0.2 ACTIVE SELFTEST
+============================================
 
-BASE
-- Derived from the proven v2.0 WRAMSEL + READ-REPAIR firmware.
-- Existing wiring is unchanged. No extra /RESET wire is required in this build.
-- RetroAchievements WRAM capture behavior is intentionally preserved.
+Comece por LEIA_PRIMEIRO_CX4_v0.2.txt.
 
-WHAT v0.1 DOES
-- Passively decodes the CX4-visible A-bus windows:
-  * $6000-$6BFF in banks $00-$3F/$80-$BF (CX4 data RAM window)
-  * $7F40-$7FAF in banks $00-$3F/$80-$BF (CX4 register window)
-- Counts physical reads/writes seen in those windows.
-- Detects the CPU reset-vector read sequence $00:FFFC -> $00:FFFD so a later
-  active CX4 build can reset without another wire.
-- Adds serial command: CX4STAT
+Esta build inicia com o barramento de dados DESARMADO. Use CX4ARM somente no
+Flash Master sem CX4 fisico, depois aperte RESET no SNES para rodar novamente
+o autoteste do Mega Man X2.
 
-IMPORTANT SAFETY / SCOPE
-- v0.1 DOES NOT DRIVE D0-D7. They remain inputs/high impedance.
-- This is deliberate: it validates decode and reset inference before the RP2350
-  is ever allowed to contend for the SNES data bus.
-- Therefore v0.1 does NOT emulate CX4 and will not make Mega Man X2 run without
-  a working CX4. It is the bus-qualification stage for the active responder.
+Comandos principais:
+  CX4STAT
+  CX4ARM
+  CX4DISARM
+  CX4RESET
 
-EXPECTED COMMAND
-CX4STAT
-Example response:
-CX4STAT mode=PASSIVE_V0.1 reads=... writes=... ram_r=... ram_w=... reg_r=... reg_w=... resets=... last_r=... last_w=... drive=OFF
-
-NEXT STAGE
-Once the captured addresses are verified on real hardware, v0.2 will add the
-PIO-timed D0-D7 responder. Only then should the RP2350 actively drive the bus.
-
-
-=== v0.1.1 LIVE-DIAG ===
-CX4STAT now also scans the current partial DMA buffer. This avoids interpreting
-reads=0/writes=0 as "no traffic" merely because the 1024-sample DMA block has not
-filled yet. D0-D7 remain input-only. No active bus driving is performed.
+Nenhum fio novo e necessario.

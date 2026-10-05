@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-add_executable(snes_rp2350b_capture main.c)
+add_executable(snes_rp2350b_capture main.c cx4_active_bus.c)
 
 pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_low.pio)
 pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_high.pio)
@@ -21,6 +21,7 @@ pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_
 
 target_link_libraries(snes_rp2350b_capture
     pico_stdlib
+    pico_multicore
     hardware_pio
     hardware_dma
     hardware_gpio

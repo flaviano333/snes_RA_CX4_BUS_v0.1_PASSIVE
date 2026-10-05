@@ -1,0 +1,18 @@
+CX4 BUS v0.2 - referencias tecnicas
+==================================
+
+Mapa externo e semantica de registradores usados nesta build foram conferidos
+contra documentacao publica do Capcom Cx4 / Hitachi HG51B S169, em especial:
+
+- RetroPortingToolKit/snesrecomp - runner/src/snes/cx4.c
+  Implementacao LLE derivada do ares (parte CX4 sob licenca ISC, conforme
+  atribuicao do projeto de origem).
+  https://github.com/RetroPortingToolKit/snesrecomp/blob/main/runner/src/snes/cx4.c
+
+- CX4_NOTES.md do mesmo projeto.
+  https://github.com/RetroPortingToolKit/snesrecomp/blob/main/runner/src/snes/CX4_NOTES.md
+
+- Notas de reverse engineering de ikari_01 / sd2snes, publicadas no nesdev.
+
+Nenhuma ROM de Mega Man X2/X3 e nenhum dump proprietario de firmware CX4 esta
+incluido neste pacote.

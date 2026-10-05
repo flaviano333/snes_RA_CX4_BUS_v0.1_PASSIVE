@@ -1,0 +1,18 @@
+CX4 BUS v0.2 ACTIVE SELFTEST
+============================
+
+- Primeiro responder CX4 ativo no hardware real.
+- Core1 dedicado a timing do barramento; loop colocado em SRAM.
+- D0-D7 controlados via SIO e tri-state por ciclo.
+- Drive DESARMADO por padrao.
+- CX4ARM / CX4DISARM / CX4RESET / CX4STAT.
+- Decode de hardware equivalente ao mapping=0 do CX4:
+  (address & $40E000) == $006000.
+- 3 KiB DRAM + mirror implementados.
+- IO $6C00-$6FFF / $7C00-$7FFF implementado.
+- Registradores basicos $7F40-$7F5F implementados.
+- Vector/interface RAM e R0-R15 implementados com mirrors.
+- Escrita $7F4F registrada como start, mas HG51B ainda e STUB nesta versao.
+- Status de execucao retorna idle para permitir que o autoteste prossiga em vez de travar.
+- Tentativa de reset sem fio extra via $00:FFFC -> $00:FFFD em core1.
+- RA v2.0 /WRAMSEL + READ-REPAIR preservado no core0/PIO/DMA.

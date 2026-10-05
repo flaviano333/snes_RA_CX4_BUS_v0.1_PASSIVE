@@ -16,6 +16,7 @@
 #include "capture_read_trigger.pio.h"
 #include "capture_read_low.pio.h"
 #include "capture_read_high.pio.h"
+#include "cx4_active_bus.h"
 
 #define PIN_PHI2       0
 #define PIN_WR         1
@@ -707,7 +708,10 @@ static void print_help(void) {
     printf("  WMSTATE                 show $2180-$2183 pointer/counters\n");
     printf("  WRAMSEL                 show v2.0 /WRAMSEL + READ-REPAIR counters\n");
     printf("  CHEESE                  show $1558/$155C values and targeted counters\n");
-    printf("  CX4STAT                 show completed + live partial CX4 bus/decode counters\n");
+    printf("  CX4STAT                 show active CX4 bus/interface counters\n");
+    printf("  CX4ARM                  ENABLE D0-D7 response for CX4 reads (then reset SNES)\n");
+    printf("  CX4DISARM               disable active response; D0-D7 immediately INPUT\n");
+    printf("  CX4RESET                reset virtual CX4 state without changing armed state\n");
     printf("  PING                    reply PONG\n");
     printf("Mirror source: /WRAMSEL-qualified writes + qualified A-bus READ-REPAIR + conservative WMDATA ($2180).\n");
     printf("DEBUG is diagnostic only: use it in PuTTY with the Python RA bridge closed.\n");
@@ -1069,7 +1073,16 @@ static void execute_command(char *line) {
     } else if (!strcmp(cmd, "CHEESE")) {
         command_cheese();
     } else if (!strcmp(cmd, "CX4STAT")) {
-        command_cx4stat();
+        cx4bus_print_status();
+    } else if (!strcmp(cmd, "CX4ARM")) {
+        cx4bus_arm(true);
+        printf("OK CX4 ACTIVE armed. D0-D7 are driven ONLY on decoded CX4 reads. Reset the SNES now.\n");
+    } else if (!strcmp(cmd, "CX4DISARM")) {
+        cx4bus_arm(false);
+        printf("OK CX4 ACTIVE disarmed; D0-D7 released to INPUT.\n");
+    } else if (!strcmp(cmd, "CX4RESET")) {
+        cx4bus_reset_state();
+        printf("OK virtual CX4 state reset.\n");
     } else {
         printf("ERR unknown command '%s' (type HELP)\n", cmd);
     }
@@ -1202,14 +1215,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + CX4 BUS v0.1.1 PASSIVE LIVE-DIAG ===\n");
+    printf("\n=== SNES RP2350B RA + CX4 BUS v0.2 ACTIVE SELFTEST ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
     printf("A11..A13=GP23..25; GP26=SKIP; A14..A21=GP27..34; /RD=GP35.\n");
     printf("A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39.\n");
     printf("GP39=/WRAMSEL is ACTIVE in v2.0; GP40 remains A10.\n");
-    printf("Type HELP for commands; CX4STAT shows completed and live partial CX4 traffic. D0-D7 DRIVE IS OFF.\n\n");
+    printf("Type HELP for commands. CX4 active responder starts DISARMED; use CX4ARM then reset SNES.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 40; ++pin) {
@@ -1295,6 +1308,11 @@ int main(void) {
         }
     }
 
+    // CX4 v0.2: switch only D0-D7 to SIO for core1-controlled tri-state output.
+    // RP2350 input paths remain visible to PIO, so the proven RA capture can keep
+    // sampling those pins even though SIO owns their output mux. Starts disarmed.
+    cx4bus_init();
+
     int dma_lo = dma_claim_unused_channel(true);
     int dma_hi = dma_claim_unused_channel(true);
 
@@ -1333,7 +1351,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.1.1 live diagnostics enabled; D0-D7 remain INPUT.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.2 active interface available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
@@ -1371,6 +1389,10 @@ int main(void) {
     pio_sm_set_enabled(pio_hi, sm_read_hi, true);
     pio_sm_set_enabled(pio_lo, sm_read_lo, true);
     pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
+
+    // Dedicated core1 handles the latency-critical active CX4 cartridge interface.
+    // It starts with response disabled; CX4ARM is required before any data pin drives.
+    cx4bus_launch_core1();
 
     uint write_buf = 0;
     uint read_buf = 0;
