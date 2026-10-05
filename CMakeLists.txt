@@ -9,21 +9,13 @@ pico_sdk_init()
 
 if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.c" OR
    NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.h")
-  message(FATAL_ERROR "CX4 LLE ausente. Rode PREPARAR_E_COMPILAR_CX4_v0.3.ps1 -RomPath <sua ROM>.")
+  message(FATAL_ERROR "CX4 LLE ausente. Rode PREPARAR_E_COMPILAR_CX4_v0.3.1.ps1 ou use o GitHub Actions desta versao.")
 endif()
-if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/cx4_game_rom.bin")
-  message(FATAL_ERROR "ROM local ausente. Rode PREPARAR_E_COMPILAR_CX4_v0.3.ps1 -RomPath <sua ROM>.")
-endif()
-
-file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/cx4_game_rom.bin" CX4_ROM_BIN_ASM)
-configure_file(${CMAKE_CURRENT_LIST_DIR}/cx4_rom_blob.S.in
-               ${CMAKE_CURRENT_BINARY_DIR}/cx4_rom_blob.S @ONLY)
 
 add_executable(snes_rp2350b_capture
     main.c
     cx4_active_bus.c
     third_party/cx4.c
-    ${CMAKE_CURRENT_BINARY_DIR}/cx4_rom_blob.S
 )
 target_include_directories(snes_rp2350b_capture PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
 

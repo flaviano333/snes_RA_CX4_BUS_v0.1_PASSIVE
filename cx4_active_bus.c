@@ -6,15 +6,16 @@
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/sio.h"
+#include "hardware/regs/addressmap.h"
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3 LLE ROM-EMBED TURBO
+ * CX4 BUS v0.3.1 LLE ROM-SLOT TURBO
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
  * RetroPortingToolKit/snesrecomp CX4 implementation; it is not redistributed
- * in this package. The user's own game ROM is embedded locally at build time.
+ * in this package. The user's own game ROM is injected locally into a reserved flash slot after build.
  *
  * v0.3 deliberately runs the DSP in TURBO-to-idle mode after CPU writes that
  * can start work. This removes real-time scheduling from the first hardware
@@ -39,8 +40,41 @@
 #define A15_MASK (1u << 28)
 #define A22_HI_MASK (1u << (36u - 32u))
 
-extern const uint8_t cx4_game_rom_start[];
-extern const uint8_t cx4_game_rom_end[];
+/* v0.3.1 keeps the game ROM in a reserved flash slot instead of linking the
+ * copyrighted ROM into the CI build.  The generic UF2 is built on GitHub; a
+ * local Python tool then appends the user's own ROM as UF2 blocks at 4 MiB. */
+#define CX4_ROM_SLOT_FLASH_OFFSET (4u * 1024u * 1024u)
+#define CX4_ROM_SLOT_HEADER_SIZE  256u
+#define CX4_ROM_SLOT_MAX_BYTES    (4u * 1024u * 1024u - CX4_ROM_SLOT_HEADER_SIZE)
+#define CX4_ROM_SLOT_MAGIC        0x52345843u /* bytes: C X 4 R */
+#define CX4_ROM_SLOT_VERSION      1u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t rom_size;
+    uint32_t crc32;
+} cx4_rom_slot_header_t;
+
+static const uint8_t *s_game_rom = NULL;
+static uint32_t s_game_rom_size = 0;
+static uint32_t s_game_rom_crc32 = 0;
+static bool s_rom_slot_valid = false;
+
+static void cx4_rom_slot_probe(void) {
+    const uint8_t *slot = (const uint8_t *)(XIP_BASE + CX4_ROM_SLOT_FLASH_OFFSET);
+    const cx4_rom_slot_header_t *h = (const cx4_rom_slot_header_t *)slot;
+    s_rom_slot_valid = false;
+    s_game_rom = NULL;
+    s_game_rom_size = 0;
+    s_game_rom_crc32 = 0;
+    if (h->magic != CX4_ROM_SLOT_MAGIC || h->version != CX4_ROM_SLOT_VERSION) return;
+    if (h->rom_size == 0 || h->rom_size > CX4_ROM_SLOT_MAX_BYTES) return;
+    s_game_rom = slot + CX4_ROM_SLOT_HEADER_SIZE;
+    s_game_rom_size = h->rom_size;
+    s_game_rom_crc32 = h->crc32;
+    s_rom_slot_valid = true;
+}
 
 static Cx4 *s_core = NULL;
 static volatile bool s_armed = false;
@@ -161,8 +195,8 @@ void cx4bus_reset_state(void) {
 }
 
 void cx4bus_init(void) {
-    const size_t rom_size = (size_t)(cx4_game_rom_end - cx4_game_rom_start);
-    s_core = cx4_create(cx4_game_rom_start, (uint32_t)rom_size, NULL, 0);
+    cx4_rom_slot_probe();
+    s_core = s_rom_slot_valid ? cx4_create(s_game_rom, s_game_rom_size, NULL, 0) : NULL;
     if (s_core) cx4_synthesize_data_rom(s_core);
 
     s_master_clock = 1;
@@ -281,19 +315,20 @@ void cx4bus_launch_core1(void) {
 }
 
 void cx4bus_print_status(void) {
-    size_t rom_size = (size_t)(cx4_game_rom_end - cx4_game_rom_start);
+    size_t rom_size = (size_t)s_game_rom_size;
     uint64_t insns = s_core ? cx4_instructions_executed(s_core) : 0;
     uint32_t rdrom = s_core ? cx4_rdrom_hits(s_core) : 0;
     uint32_t runs = s_core ? cx4_run_ring_count(s_core) : 0;
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_ROM_EMBED_TURBO_V0.3 armed=%u drive=%s core1=%u core=%u "
-           "rom_bytes=%lu firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
+    printf("CX4STAT mode=LLE_ROM_SLOT_TURBO_V0.3.1 armed=%u drive=%s core1=%u core=%u "
+           "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
            "cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed ? 1u : 0u, s_driving ? "ON" : "OFF", s_core1_started ? 1u : 0u,
-           s_core ? 1u : 0u, (unsigned long)rom_size, fw, locked,
+           s_core ? 1u : 0u, s_rom_slot_valid ? 1u : 0u, (unsigned long)rom_size,
+           (unsigned long)s_game_rom_crc32, fw, locked,
            (unsigned long)runs, (unsigned long long)insns, (unsigned long)rdrom,
            (unsigned long long)s_turbo_runs, s_work_pending ? 1u : 0u,
            (unsigned long long)s_cpu_reads, (unsigned long long)s_cpu_writes,

@@ -1,0 +1,8 @@
+CX4 BUS v0.3.1
+===============
+- Corrige o build no GitHub Actions: o workflow agora baixa e adapta o core LLE antes do CMake.
+- Remove a dependencia de uma ROM comercial durante a compilacao CI.
+- Reserva um slot de ROM na flash de 16 MB da SpotPear a partir de 4 MB.
+- Adiciona inject_rom_into_uf2.py para combinar localmente a ROM do usuario com o UF2 generico.
+- CX4STAT agora mostra rom_slot, rom_bytes e rom_crc.
+- Mantem o core LLE/turbo e a pinagem da v0.3.
