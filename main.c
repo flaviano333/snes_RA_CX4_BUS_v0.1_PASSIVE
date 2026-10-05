@@ -31,13 +31,23 @@
 #define CMD_BUF_SIZE   4096
 #define DEBUG_MAX_LINES 4096u
 
-// CX4 BUS v0.1 passive qualification layer. No GPIO is driven yet.
+// CX4 BUS v0.1.1 passive qualification layer. No GPIO is driven yet.
+// Adds non-destructive inspection of the currently filling DMA buffers so CX4STAT
+// no longer has to wait for a complete 1024-sample batch.
 // This first build proves address decode/reset-vector observation while preserving RA v2.0.
 static uint64_t cx4_reads = 0, cx4_writes = 0, cx4_ram_reads = 0, cx4_ram_writes = 0;
 static uint64_t cx4_reg_reads = 0, cx4_reg_writes = 0, cx4_reset_vectors = 0;
+static uint64_t cx4_ram_mirror_reads = 0, cx4_ram_mirror_writes = 0;
 static uint32_t cx4_last_read = 0, cx4_last_write = 0;
 static uint8_t cx4_last_wdata = 0, cx4_last_rdata = 0;
 static bool cx4_reset_armed = false;
+
+// Live DMA diagnostic handles. These are populated after DMA setup. CX4STAT only
+// reads the already-written prefix of the active buffers; it never pauses DMA.
+static int cx4_dma_write_lo = -1, cx4_dma_write_hi = -1;
+static int cx4_dma_read_lo = -1, cx4_dma_read_hi = -1;
+static volatile uint cx4_active_write_buf = 0;
+static volatile uint cx4_active_read_buf = 0;
 #define SNAP_MAX_RANGES 256u
 #define SNAP_MAX_BYTES  4096u
 
@@ -254,8 +264,9 @@ static inline int cx4_region(uint32_t address) {
     uint8_t bank = (uint8_t)(address >> 16);
     uint16_t off = (uint16_t)address;
     if (!cx4_bank(bank)) return 0;
-    if (off >= 0x6000u && off <= 0x6bffu) return 1; // CX4 data RAM window
-    if (off >= 0x7f40u && off <= 0x7fafu) return 2; // CX4 register window
+    if (off >= 0x6000u && off <= 0x6bffu) return 1; // CX4 3 KiB data RAM
+    if (off >= 0x7000u && off <= 0x7bffu) return 3; // mirror of $6000-$6BFF
+    if (off >= 0x7f40u && off <= 0x7fbfu) return 2; // control/vector/GPR/zero area
     return 0;
 }
 
@@ -263,7 +274,7 @@ static void cx4_observe_write(uint32_t address, uint8_t data) {
     int r = cx4_region(address);
     if (!r) return;
     ++cx4_writes; cx4_last_write = address; cx4_last_wdata = data;
-    if (r == 1) ++cx4_ram_writes; else ++cx4_reg_writes;
+    if (r == 1) ++cx4_ram_writes; else if (r == 3) ++cx4_ram_mirror_writes; else ++cx4_reg_writes;
 }
 
 static void cx4_observe_read(uint32_t address, uint8_t data) {
@@ -278,18 +289,80 @@ static void cx4_observe_read(uint32_t address, uint8_t data) {
     int r = cx4_region(address);
     if (!r) return;
     ++cx4_reads; cx4_last_read = address; cx4_last_rdata = data;
-    if (r == 1) ++cx4_ram_reads; else ++cx4_reg_reads;
+    if (r == 1) ++cx4_ram_reads; else if (r == 3) ++cx4_ram_mirror_reads; else ++cx4_reg_reads;
+}
+
+static uint32_t cx4_dma_pair_captured(int dma_a, int dma_b) {
+    if (dma_a < 0 || dma_b < 0) return 0;
+    uint32_t ra = dma_remaining((uint)dma_a);
+    uint32_t rb = dma_remaining((uint)dma_b);
+    uint32_t ca = (ra <= SAMPLE_COUNT) ? (SAMPLE_COUNT - ra) : 0;
+    uint32_t cb = (rb <= SAMPLE_COUNT) ? (SAMPLE_COUNT - rb) : 0;
+    return ca < cb ? ca : cb;
+}
+
+typedef struct {
+    uint32_t samples;
+    uint32_t cx4_total;
+    uint32_t ram;
+    uint32_t mirror;
+    uint32_t regs;
+    uint32_t vec_fffc;
+    uint32_t vec_fffd;
+    uint32_t last_addr;
+    uint8_t last_data;
+} cx4_live_diag_t;
+
+static void cx4_scan_partial(const uint32_t *low_buf, const uint32_t *high_buf,
+                             uint32_t count, bool is_read, cx4_live_diag_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->samples = count;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t low18 = unpack_low18(low_buf[i]);
+        uint32_t high20 = unpack_high20(high_buf[i]);
+        uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
+        uint8_t data = reconstruct_data(low18);
+        if (is_read) {
+            if (address == 0x00fffcu) ++out->vec_fffc;
+            if (address == 0x00fffdu) ++out->vec_fffd;
+        }
+        int r = cx4_region(address);
+        if (!r) continue;
+        ++out->cx4_total;
+        if (r == 1) ++out->ram;
+        else if (r == 3) ++out->mirror;
+        else ++out->regs;
+        out->last_addr = address;
+        out->last_data = data;
+    }
 }
 
 static void command_cx4stat(void) {
-    printf("CX4STAT mode=PASSIVE_V0.1 reads=%llu writes=%llu ram_r=%llu ram_w=%llu reg_r=%llu reg_w=%llu resets=%llu "
-           "last_r=%06lX:%02X last_w=%06lX:%02X drive=OFF\\n",
+    cx4_live_diag_t lr, lw;
+    uint32_t nr = cx4_dma_pair_captured(cx4_dma_read_lo, cx4_dma_read_hi);
+    uint32_t nw = cx4_dma_pair_captured(cx4_dma_write_lo, cx4_dma_write_hi);
+    uint rb = cx4_active_read_buf & 1u;
+    uint wb = cx4_active_write_buf & 1u;
+    cx4_scan_partial(read_low_samples[rb], read_high_samples[rb], nr, true, &lr);
+    cx4_scan_partial(low_samples[wb], high_samples[wb], nw, false, &lw);
+
+    printf("CX4STAT mode=PASSIVE_V0.1.1 "
+           "done_r=%llu done_w=%llu ram_r=%llu ram_w=%llu mir_r=%llu mir_w=%llu reg_r=%llu reg_w=%llu resets=%llu "
+           "last_r=%06lX:%02X last_w=%06lX:%02X "
+           "pending_r=%lu live_cx4_r=%lu live_ram_r=%lu live_mir_r=%lu live_reg_r=%lu vec=%lu/%lu "
+           "pending_w=%lu live_cx4_w=%lu live_ram_w=%lu live_mir_w=%lu live_reg_w=%lu drive=OFF\n",
            (unsigned long long)cx4_reads, (unsigned long long)cx4_writes,
            (unsigned long long)cx4_ram_reads, (unsigned long long)cx4_ram_writes,
+           (unsigned long long)cx4_ram_mirror_reads, (unsigned long long)cx4_ram_mirror_writes,
            (unsigned long long)cx4_reg_reads, (unsigned long long)cx4_reg_writes,
            (unsigned long long)cx4_reset_vectors,
            (unsigned long)cx4_last_read, cx4_last_rdata,
-           (unsigned long)cx4_last_write, cx4_last_wdata);
+           (unsigned long)cx4_last_write, cx4_last_wdata,
+           (unsigned long)lr.samples, (unsigned long)lr.cx4_total,
+           (unsigned long)lr.ram, (unsigned long)lr.mirror, (unsigned long)lr.regs,
+           (unsigned long)lr.vec_fffc, (unsigned long)lr.vec_fffd,
+           (unsigned long)lw.samples, (unsigned long)lw.cx4_total,
+           (unsigned long)lw.ram, (unsigned long)lw.mirror, (unsigned long)lw.regs);
 }
 
 static bool map_address_to_wram(uint32_t address, uint32_t *offset, bool *direct) {
@@ -634,7 +707,7 @@ static void print_help(void) {
     printf("  WMSTATE                 show $2180-$2183 pointer/counters\n");
     printf("  WRAMSEL                 show v2.0 /WRAMSEL + READ-REPAIR counters\n");
     printf("  CHEESE                  show $1558/$155C values and targeted counters\n");
-    printf("  CX4STAT                 show passive CX4 bus/decode/reset-vector counters\n");
+    printf("  CX4STAT                 show completed + live partial CX4 bus/decode counters\n");
     printf("  PING                    reply PONG\n");
     printf("Mirror source: /WRAMSEL-qualified writes + qualified A-bus READ-REPAIR + conservative WMDATA ($2180).\n");
     printf("DEBUG is diagnostic only: use it in PuTTY with the Python RA bridge closed.\n");
@@ -1129,14 +1202,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + CX4 BUS v0.1 PASSIVE ===\n");
+    printf("\n=== SNES RP2350B RA + CX4 BUS v0.1.1 PASSIVE LIVE-DIAG ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
     printf("A11..A13=GP23..25; GP26=SKIP; A14..A21=GP27..34; /RD=GP35.\n");
     printf("A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39.\n");
     printf("GP39=/WRAMSEL is ACTIVE in v2.0; GP40 remains A10.\n");
-    printf("Type HELP for commands; CX4STAT shows CX4-window traffic. D0-D7 DRIVE IS OFF in v0.1.\n\n");
+    printf("Type HELP for commands; CX4STAT shows completed and live partial CX4 traffic. D0-D7 DRIVE IS OFF.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 40; ++pin) {
@@ -1240,6 +1313,14 @@ int main(void) {
     int dma_read_lo = dma_claim_unused_channel(true);
     int dma_read_hi = dma_claim_unused_channel(true);
 
+    // Expose channel numbers to CX4STAT's non-destructive live scanner.
+    cx4_dma_write_lo = dma_lo;
+    cx4_dma_write_hi = dma_hi;
+    cx4_dma_read_lo = dma_read_lo;
+    cx4_dma_read_hi = dma_read_hi;
+    cx4_active_write_buf = 0;
+    cx4_active_read_buf = 0;
+
     dma_channel_config dc_read_lo = dma_channel_get_default_config(dma_read_lo);
     channel_config_set_transfer_data_size(&dc_read_lo, DMA_SIZE_32);
     channel_config_set_read_increment(&dc_read_lo, false);
@@ -1252,7 +1333,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.1 passive decoder enabled; D0-D7 remain INPUT.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.1.1 live diagnostics enabled; D0-D7 remain INPUT.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
@@ -1310,6 +1391,7 @@ int main(void) {
             dma_channel_set_trans_count(dma_hi, SAMPLE_COUNT, false);
             dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
             write_buf = next;
+            cx4_active_write_buf = next;
 
             // Decode the completed buffer while hardware fills the alternate one.
             process_write_batch(low_samples[done], high_samples[done]);
@@ -1325,6 +1407,7 @@ int main(void) {
             dma_channel_set_trans_count(dma_read_hi, SAMPLE_COUNT, false);
             dma_start_channel_mask((1u << dma_read_lo) | (1u << dma_read_hi));
             read_buf = next;
+            cx4_active_read_buf = next;
 
             process_read_batch(read_low_samples[done], read_high_samples[done]);
         }

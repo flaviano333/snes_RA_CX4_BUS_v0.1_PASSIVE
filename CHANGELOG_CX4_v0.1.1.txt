@@ -1,0 +1,17 @@
+SNES RA + CX4 BUS v0.1.1 PASSIVE LIVE-DIAG
+
+Changes from v0.1:
+- D0-D7 are STILL INPUT ONLY. This build cannot contend with the cartridge bus.
+- CX4STAT now inspects the already-written prefix of the active DMA buffers without
+  stopping DMA. This exposes traffic that has not yet filled a 1024-sample batch.
+- Added pending_r / pending_w and live_cx4_* fields.
+- Added reset-vector sightings in the active read buffer: vec=FFFC/FFFD.
+- Expanded passive CX4 decode to include the documented $7000-$7BFF mirror and
+  $7F40-$7FBF control/vector/GPR/zero region.
+- RA v2.0 WRAMSEL + READ-REPAIR logic is unchanged.
+
+Interpretation:
+- done_* = traffic already committed by completed 1024-sample DMA batches.
+- pending_* = paired samples currently sitting in the active DMA buffer.
+- live_cx4_* = CX4-window accesses found in that pending prefix.
+- vec=A/B = sightings of $00:FFFC and $00:FFFD in the pending read prefix.

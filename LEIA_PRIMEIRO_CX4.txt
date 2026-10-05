@@ -30,3 +30,9 @@ CX4STAT mode=PASSIVE_V0.1 reads=... writes=... ram_r=... ram_w=... reg_r=... reg
 NEXT STAGE
 Once the captured addresses are verified on real hardware, v0.2 will add the
 PIO-timed D0-D7 responder. Only then should the RP2350 actively drive the bus.
+
+
+=== v0.1.1 LIVE-DIAG ===
+CX4STAT now also scans the current partial DMA buffer. This avoids interpreting
+reads=0/writes=0 as "no traffic" merely because the 1024-sample DMA block has not
+filled yet. D0-D7 remain input-only. No active bus driving is performed.
