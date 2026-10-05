@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.3.2 LLE ROM-SLOT TURBO
+ * CX4 BUS v0.3.3 LLE FAST-BUS TRACE
  * ---------------------------------
  * Active SNES-side interface backed by an instruction-level HG51B S169 core.
  * The core source is fetched at build time from the permissively licensed
@@ -40,7 +40,7 @@
 #define A15_MASK (1u << 28)
 #define A22_HI_MASK (1u << (36u - 32u))
 
-/* v0.3.2 keeps the game ROM in a reserved flash slot instead of linking the
+/* v0.3.3 keeps the game ROM in a reserved flash slot instead of linking the
  * copyrighted ROM into the CI build.  The generic UF2 is built on GitHub; a
  * local Python tool then appends the user's own ROM as UF2 blocks at 4 MiB. */
 #define CX4_ROM_SLOT_FLASH_OFFSET (4u * 1024u * 1024u)
@@ -101,6 +101,30 @@ static volatile uint32_t s_last_read_addr = 0;
 static volatile uint32_t s_last_write_addr = 0;
 static volatile uint8_t s_last_read_data = 0;
 static volatile uint8_t s_last_write_data = 0;
+
+
+/* Last IO operations as seen by the ACTIVE responder. This is intentionally
+ * tiny and lock-free: core1 is the only writer, the USB command is a reader.
+ * It lets us see whether the self-test wrote a value and then read the same
+ * interface register back without perturbing the latency-critical path. */
+static inline bool off_is_io(uint16_t off);
+
+typedef struct {
+    uint16_t off;
+    uint8_t data;
+    uint8_t op; /* 'R' or 'W' */
+} cx4_trace_entry_t;
+#define CX4_TRACE_N 64u
+static volatile cx4_trace_entry_t s_trace[CX4_TRACE_N];
+static volatile uint32_t s_trace_seq = 0;
+
+static inline void trace_io(uint8_t op, uint16_t off, uint8_t data) {
+    if (!off_is_io(off)) return;
+    uint32_t i = s_trace_seq++ & (CX4_TRACE_N - 1u);
+    s_trace[i].off = off;
+    s_trace[i].data = data;
+    s_trace[i].op = op;
+}
 
 static inline uint8_t raw_data(uint32_t lo) {
     return (uint8_t)(((lo >> 2) & 0x07u) | ((lo >> 3) & 0xf8u));
@@ -227,6 +251,10 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
     data_release();
 
     for (;;) {
+        /* Start every transaction from PHI2 low, then sample shortly AFTER the
+         * rising edge. v0.3.2 sampled /RD,/WR/address immediately at the edge,
+         * before the SNES bus had the same settling margin used by our proven
+         * PIO capture path. */
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
         if (s_reset_requested) {
@@ -235,6 +263,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
         }
 
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
+        __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
 
         uint32_t lo = sio_hw->gpio_in;
         uint32_t hi = sio_hw->gpio_hi_in;
@@ -244,14 +273,17 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
         if (is_read) {
             if (raw_is_cx4(lo, hi)) {
                 uint16_t off = raw_cx4_offset(lo, hi);
-                /* Give pending LLE work a small chance to advance even if it was
-                 * not started by a register we currently recognize. */
-                core_step_master(128u);
+
+                /* LATENCY RULE: do NOT run/sync the DSP on the SNES read path.
+                 * v0.3.2 performed 64-bit clock conversion + cx4_sync here,
+                 * delaying D0-D7 until too late in the bus cycle. Core0 owns
+                 * DSP execution; core1 only fetches the already-visible byte. */
                 uint8_t v = s_core ? cx4_read(s_core, off) : 0u;
                 s_cpu_reads++;
                 if (off_is_io(off)) s_io_reads++; else s_dram_reads++;
                 s_last_read_addr = off;
                 s_last_read_data = v;
+                trace_io('R', off, v);
                 if (s_armed) {
                     data_drive(v);
                     s_driven_reads++;
@@ -276,8 +308,13 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
 
         if (is_write && raw_is_cx4(lo, hi)) {
             uint16_t off = raw_cx4_offset(lo, hi);
-            while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
+
+            /* Capture write data while PHI2 is still HIGH. The old responder
+             * waited for the falling edge and only then executed C code to read
+             * GPIO, which can miss the SNES data-hold window. */
+            __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
             uint8_t v = raw_data(sio_hw->gpio_in);
+            while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
             if (s_core) {
                 cx4_write(s_core, off, v);
@@ -287,6 +324,7 @@ static void __not_in_flash_func(cx4bus_core1)(void) {
             if (off_is_io(off)) s_io_writes++; else s_dram_writes++;
             s_last_write_addr = off;
             s_last_write_data = v;
+            trace_io('W', off, v);
             continue;
         }
 
@@ -314,6 +352,19 @@ void cx4bus_launch_core1(void) {
     while (!s_core1_started) tight_loop_contents();
 }
 
+void cx4bus_print_trace(void) {
+    uint32_t end = s_trace_seq;
+    uint32_t n = end < CX4_TRACE_N ? end : CX4_TRACE_N;
+    uint32_t start = end - n;
+    printf("CX4TRACE count=%lu seq=%lu (oldest->newest)\n",
+           (unsigned long)n, (unsigned long)end);
+    for (uint32_t k = 0; k < n; ++k) {
+        uint32_t seq = start + k;
+        cx4_trace_entry_t e = s_trace[seq & (CX4_TRACE_N - 1u)];
+        printf("  %c %04X %02X\n", e.op ? e.op : '?', e.off, e.data);
+    }
+}
+
 void cx4bus_print_status(void) {
     size_t rom_size = (size_t)s_game_rom_size;
     uint64_t insns = s_core ? cx4_instructions_executed(s_core) : 0;
@@ -322,7 +373,7 @@ void cx4bus_print_status(void) {
     int fw = s_core ? cx4_firmware_loaded(s_core) : 0;
     int locked = s_core ? cx4_locked(s_core) : 0;
 
-    printf("CX4STAT mode=LLE_ROM_SLOT_TURBO_V0.3.2 armed=%u drive=%s core1=%u core=%u "
+    printf("CX4STAT mode=LLE_FASTBUS_TRACE_V0.3.3 armed=%u drive=%s core1=%u core=%u "
            "rom_slot=%u rom_bytes=%lu rom_crc=%08lX firmware=%d locked=%d runs=%lu insns=%llu rdrom=%lu service=%llu pending=%u "
            "cpu_r=%llu cpu_w=%llu driven=%llu dram_r=%llu dram_w=%llu io_r=%llu io_w=%llu "
            "vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",

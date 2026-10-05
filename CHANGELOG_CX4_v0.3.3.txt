@@ -1,0 +1,8 @@
+CX4 BUS v0.3.3 - LLE FAST-BUS TRACE
+
+- Fix principal: remove cx4_sync/core_step_master from the latency-critical SNES READ path.
+- /RD, /WR and address are sampled after a short PHI2-high settling delay.
+- Write data is sampled while PHI2 is still HIGH instead of after the falling edge.
+- Adds CX4TRACE: last 64 IO reads/writes seen by the active responder.
+- Keeps v0.3.2 ROM slot/injector and the v2.0 WRAM READ-REPAIR path.
+- Still experimental: the LLE core and SNES-side bus share state across cores; this version is aimed at validating the interface/self-test timing before final synchronization.
