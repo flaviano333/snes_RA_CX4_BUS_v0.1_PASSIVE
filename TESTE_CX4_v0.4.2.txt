@@ -1,9 +1,0 @@
-TESTE CX4 v0.4.2
-
-1. Build GitHub Actions and download CX4_v0.4.2_GENERIC_SEM_ROM.uf2.
-2. Inject Mega Man X2 with INJETAR_ROM_NO_UF2.bat.
-3. Flash the _COM_ROM.uf2.
-4. CX4SELF -> expected 21704 instructions / 1024 ROM reads.
-5. CX4RESET, CX4ARM, reset SNES.
-6. Enter gameplay and inspect sprites.
-7. CX4STAT: armed=1, driven>0, hle_jobs>0, hle_oam>0, hle_snap should equal hle_jobs.

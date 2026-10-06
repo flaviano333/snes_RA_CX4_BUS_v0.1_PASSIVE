@@ -1,6 +1,0 @@
-CX4 BUS v0.1
-- Preserves RA v2.0 WRAMSEL + READ-REPAIR.
-- Adds passive CX4 RAM/register address decode and counters.
-- Adds reset-vector inference from reads of $00:FFFC then $00:FFFD.
-- Adds CX4STAT command.
-- D0-D7 active drive intentionally disabled in this qualification build.

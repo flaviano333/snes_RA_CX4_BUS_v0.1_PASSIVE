@@ -2,22 +2,21 @@
 .program snes_bus_drive_split
 ; PIO0 shared program for SM2 and SM3. GPIO base = 0.
 ;
-; The final validator does not ask Core1 to calculate a byte during /RD.
-; Instead the test ROM expects DATA = A0..A7. The two state machines sample
-; those address bits directly in PIO and copy them onto the split D bus:
-;
 ;   SM2: X=0, IN base GP11 (A0), OUT/SET base GP2  -> D0..D2 (3 bits)
 ;   SM3: X=1, IN base GP14 (A3), OUT/SET base GP6  -> D3..D7 (5 bits)
 ;
-; WAIT IRQ 0 REL maps to IRQ2 on SM2 and IRQ3 on SM3. PIO2 only publishes
-; those IRQs when /RD is LOW, /ROMSEL is HIGH and /WRAMSEL is HIGH.
-; Both SMs remain disabled except for the READ phase of one BUSARM validation pass.
-; Each SM re-checks /WR=HIGH before changing any data-pin direction.
+; Cross-PIO start:
+;   WAIT IRQ 0 REL -> IRQ2 on SM2, IRQ3 on SM3.
+; Cross-PIO release:
+;   WAIT IRQ 2 REL -> IRQ4 on SM2, IRQ5 on SM3.
+;
+; PIO2 emits release only when physical /RD actually rises, so D0-D7 stay
+; valid for the complete CPU read window. /WR is rechecked before driving.
 .wrap_target
 drive_loop:
     wait 1 irq 0 rel
-    jmp pin read_not_write     ; JMP pin = GP1 /WR. LOW => never drive
-    jmp drive_loop
+    jmp pin read_not_write     ; GP1 /WR HIGH => genuine read
+    jmp no_drive_release
 read_not_write:
     jmp !x low_three
 
@@ -27,7 +26,7 @@ high_five:
     mov osr, isr
     out pins, 5
     set pindirs, 31
-    jmp hold_until_phi_fall
+    jmp hold_until_rd_release
 
 low_three:
     mov isr, null
@@ -36,8 +35,12 @@ low_three:
     out pins, 3
     set pindirs, 31
 
-hold_until_phi_fall:
-    wait 0 gpio 0
+hold_until_rd_release:
+    wait 1 irq 2 rel
     set pindirs, 0
+    jmp drive_loop
+
+no_drive_release:
+    wait 1 irq 2 rel
     jmp drive_loop
 .wrap

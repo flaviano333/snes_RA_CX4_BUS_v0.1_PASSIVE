@@ -41,9 +41,9 @@ a.emit(0xA9,0x7C,0x8D,0x22,0x21)  # BGR555 high
 a.emit(0xA9,0x0F,0x8D,0x00,0x21)  # display on, max brightness
 a.emit(0x85,0x00,0x85,0x01,0x85,0x02,0x85,0x03)  # clear zp 00-03
 a.label('main')
-# Robust handshake: emit BUS7 at the beginning of EVERY pass.
+# Robust handshake: emit BUS9 at the beginning of EVERY pass.
 # The RP validator may start after the SNES, so a one-shot boot signature is not sufficient.
-for addr,val in [(0x7ff0,ord('B')),(0x7ff1,ord('U')),(0x7ff2,ord('S')),(0x7ff3,ord('8'))]:
+for addr,val in [(0x7ff0,ord('B')),(0x7ff1,ord('U')),(0x7ff2,ord('S')),(0x7ff3,ord('9'))]:
     a.emit(0xA9,val,0x8D,addr&0xff,addr>>8)
 a.emit(0xE6,0x02)         # INC sequence
 a.emit(0xA5,0x02,0x8D,0xF4,0x7F)  # seq -> $7FF4

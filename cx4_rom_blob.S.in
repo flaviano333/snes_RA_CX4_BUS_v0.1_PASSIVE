@@ -1,8 +1,0 @@
-.section .rodata.cx4_game_rom,"a",%progbits
-.balign 4
-.global cx4_game_rom_start
-.global cx4_game_rom_end
-cx4_game_rom_start:
-.incbin "@CX4_ROM_BIN_ASM@"
-cx4_game_rom_end:
-.balign 4

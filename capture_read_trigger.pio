@@ -6,19 +6,20 @@
 ;   GP35 /RD     -> WAIT GPIO index 19 (35-16)
 ;   GP38 /ROMSEL -> JMP PIN configured by C
 ;
-; After a short settle delay, LOW /ROMSEL is a genuine cartridge-ROM access. Such a cycle is never
-; forwarded to the active responder. A HIGH /ROMSEL read raises local PIO2
-; IRQ4 for SM1 to apply the /WRAMSEL gate.
+; For an open (/ROMSEL HIGH) read, local IRQ4 marks the qualified-read start
+; for SM1 and local IRQ5 marks the REAL /RD rising edge.  This lets PIO0 hold
+; D0-D7 until /RD actually ends instead of approximating release with PHI2.
 .wrap_target
 rd_loop:
     wait 0 gpio 19
     nop [3]                 ; allow /ROMSEL to settle after /RD falls
     jmp pin romsel_open
-    jmp rd_release
+    wait 1 gpio 19          ; ROM cycle: never forward to responder
+    jmp rd_loop
 romsel_open:
-    irq 4
-rd_release:
-    wait 1 gpio 19
+    irq 4                   ; local start token for SM1
+    wait 1 gpio 19          ; exact /RD release
+    irq 5                   ; local release token for SM1
     jmp rd_loop
 .wrap
 
@@ -26,16 +27,21 @@ rd_release:
 ; PIO2 SM1: second-stage /WRAMSEL gate.
 ; JMP PIN is physical GP39 /WRAMSEL, active LOW.
 ;
-; Only reads with BOTH /ROMSEL HIGH and /WRAMSEL HIGH reach PIO0.
-; IRQ2 and IRQ3 are separate so two PIO0 data state machines can consume the
-; same qualified /RD event without racing over one IRQ flag.
+; If /ROMSEL and /WRAMSEL are both HIGH, publish cross-PIO start IRQ2/3.
+; Then wait for SM0's exact /RD-rise token and publish release IRQ4/5.
+; Rejected WRAM cycles still consume IRQ5 so the two SMs stay synchronized.
 .wrap_target
 qual_loop:
     wait 1 irq 4
     jmp pin qualified
+rejected:
+    wait 1 irq 5
     jmp qual_loop
 qualified:
     irq next 2
     irq next 3
+    wait 1 irq 5
+    irq next 4
+    irq next 5
     jmp qual_loop
 .wrap
