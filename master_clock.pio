@@ -1,0 +1,20 @@
+.pio_version 1
+.program snes_master_clock_counter
+; RP2350 PIO2, GPIO base = 16
+; in_base = GP41 (SYSTEM CLK after 5V->3.3V level shift)
+; Emit one RX token for every 1024 complete master-clock cycles.
+; A DMA channel drains the FIFO continuously, so the CPU can recover the
+; elapsed SNES master-clock count from DMA transfer_count without servicing
+; every 21.477 MHz edge.
+.wrap_target
+    set y, 31
+outer:
+    set x, 31
+inner:
+    wait 1 pin 0
+    wait 0 pin 0
+    jmp x-- inner
+    jmp y-- outer
+    mov isr, null
+    push block
+.wrap

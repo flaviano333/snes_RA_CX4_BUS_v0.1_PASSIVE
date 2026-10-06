@@ -12,6 +12,7 @@
 
 #include "capture_low.pio.h"
 #include "capture_high.pio.h"
+#include "master_clock.pio.h"
 #include "cx4_active_bus.h"
 
 #define PIN_PHI2       0u
@@ -21,6 +22,8 @@
 #define PIN_RD         35u
 #define PIN_ROMSEL     38u
 #define PIN_WRAMSEL    39u
+#define PIN_MASTER_CLK  41u
+#define PIN_RESET       42u
 
 #define SAMPLE_COUNT 1024u
 #define GAMEPLAY_CLOCK_KHZ 150000u
@@ -29,7 +32,11 @@ static uint32_t low_samples[2][SAMPLE_COUNT];
 static uint32_t high_samples[2][SAMPLE_COUNT];
 static uint32_t scan_pos[2] = {0,0};
 
-static int dma_lo = -1, dma_hi = -1;
+static int dma_lo = -1, dma_hi = -1, dma_clk = -1;
+static volatile uint32_t master_dma_sink = 0;
+static uint64_t master_blocks_base = 0;
+#define MASTER_BLOCK_CYCLES 1024ull
+#define MASTER_DMA_COUNT 0x0fffffffu
 static uint active_buf = 0;
 static uint64_t write_pairs_seen = 0;
 static uint64_t write_pairs_qualified = 0;
@@ -41,6 +48,22 @@ static size_t cmd_len = 0;
 
 static inline uint32_t dma_remaining(uint channel) {
     return dma_channel_hw_addr(channel)->transfer_count & 0x0fffffffu;
+}
+
+static uint64_t master_clock_ticks(void) {
+    if (dma_clk < 0) return 0;
+    uint32_t rem = dma_remaining((uint)dma_clk);
+    uint64_t done = (uint64_t)(MASTER_DMA_COUNT - rem);
+    return (master_blocks_base + done) * MASTER_BLOCK_CYCLES;
+}
+
+static void master_clock_rearm_if_needed(PIO pio_clk, uint sm_clk) {
+    if (dma_clk < 0) return;
+    if (dma_remaining((uint)dma_clk) != 0u) return;
+    master_blocks_base += MASTER_DMA_COUNT;
+    dma_channel_set_read_addr((uint)dma_clk, &pio_clk->rxf[sm_clk], false);
+    dma_channel_set_write_addr((uint)dma_clk, (void *)&master_dma_sink, false);
+    dma_channel_set_trans_count((uint)dma_clk, MASTER_DMA_COUNT, true);
 }
 
 static inline uint32_t unpack_low18(uint32_t raw) {
@@ -127,13 +150,17 @@ static void strtoupper_inplace(char *s) {
 }
 
 static void command_info(void) {
-    printf("LASTBUS clock_khz=%u write_pairs=%llu qualified=%llu rejected_ctrl=%llu rearms=%llu active_buf=%u scan=%lu/%u\n",
+    const uint64_t mt = master_clock_ticks();
+    printf("LASTBUS clock_khz=%u write_pairs=%llu qualified=%llu rejected_ctrl=%llu rearms=%llu active_buf=%u scan=%lu/%u "
+           "sysclk_master=%llu reset=%s\n",
            GAMEPLAY_CLOCK_KHZ,
            (unsigned long long)write_pairs_seen,
            (unsigned long long)write_pairs_qualified,
            (unsigned long long)write_pairs_rejected_ctrl,
            (unsigned long long)dma_rearms,
-           active_buf, (unsigned long)scan_pos[active_buf], SAMPLE_COUNT);
+           active_buf, (unsigned long)scan_pos[active_buf], SAMPLE_COUNT,
+           (unsigned long long)mt,
+           gpio_get(PIN_RESET) ? "HIGH" : "LOW");
     cx4bus_print_status();
 }
 
@@ -176,23 +203,28 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 BOOTBACK HLE TRANSFORM-LINES V5 ===\n");
-    printf("clock=%u kHz | lean build + v0.5 boot-path HLE\n", GAMEPLAY_CLOCK_KHZ);
-    printf("pinout unchanged: PHI2=GP0 /WR=GP1 D0-2=GP2-4 GP5=SKIP D3-7=GP6-10 /RD=GP35 /ROMSEL=GP38 /WRAMSEL=GP39 A10=GP40\n");
+    printf("\n=== SNES RP2350B CX4 SYSCLK+RESET HYBRID V6 ===\n");
+    printf("clock=%u kHz | proven HLE boot path + exact LLE fallback\n", GAMEPLAY_CLOCK_KHZ);
+    printf("existing pinout preserved; NEW: SYSTEM CLK=GP41, /RESET=GP42 (BOTH LEVEL-SHIFTED TO 3.3V)\n");
     printf("write authority: PIO+DMA, qualified by /ROMSEL HIGH + /WRAMSEL HIGH\n");
     printf("read responder: preserved v0.5 PHI2 timing + /ROMSEL HIGH + /WRAMSEL HIGH + /WR HIGH\n");
-    printf("CX4 response auto-arms; runtime LLE disabled; $7F5E BUSY now brackets every HLE command.\n\n");
+    printf("known commands use HLE; unhandled commands fall back to exact HG51B clocked from real SNES SYSTEM CLK; /RESET is authoritative.\n\n");
     fflush(stdout);
 
     for (uint pin=0; pin<=40u; ++pin) {
         configure_input(pin, pin==PIN_WR || pin==PIN_RD || pin==PIN_ROMSEL || pin==PIN_WRAMSEL);
     }
+    /* GP41/GP42 are NOT 5V-tolerant on RP2350B. The hardware connection must
+       level-shift the SNES signals to 3.3 V before they reach these GPIOs. */
+    configure_input(PIN_RESET, false);
 
     PIO pio_lo = pio0;
     PIO pio_hi = pio1;
-    const uint sm_lo = 0, sm_hi = 0;
+    PIO pio_clk = pio2;
+    const uint sm_lo = 0, sm_hi = 0, sm_clk = 0;
     int base_lo = pio_set_gpio_base(pio_lo, 0);
     int base_hi = pio_set_gpio_base(pio_hi, 16);
+    int base_clk = pio_set_gpio_base(pio_clk, 16);
 
     for (uint pin=0; pin<=19u; ++pin) pio_gpio_init(pio_lo, pin);
     for (uint pin=21; pin<=40u; ++pin) pio_gpio_init(pio_hi, pin);
@@ -214,8 +246,20 @@ int main(void) {
     sm_config_set_fifo_join(&cfg_hi, PIO_FIFO_JOIN_RX);
     int init_hi = pio_sm_init(pio_hi, sm_hi, off_hi, &cfg_hi);
 
-    printf("PIO write capture: base=%d/%d init=%d/%d\n",base_lo,base_hi,init_lo,init_hi);
-    if (base_lo || base_hi || init_lo || init_hi) {
+    /* PIO2 counts the physical 21.477 MHz SNES master clock in blocks of 1024.
+       The RX FIFO is drained by DMA, so no CPU interrupt is needed per edge. */
+    gpio_disable_pulls(PIN_MASTER_CLK);
+    pio_gpio_init(pio_clk, PIN_MASTER_CLK);
+    pio_sm_set_consecutive_pindirs(pio_clk, sm_clk, PIN_MASTER_CLK, 1, false);
+    uint off_clk = pio_add_program(pio_clk, &snes_master_clock_counter_program);
+    pio_sm_config cfg_clk = snes_master_clock_counter_program_get_default_config(off_clk);
+    sm_config_set_in_pins(&cfg_clk, PIN_MASTER_CLK);
+    sm_config_set_fifo_join(&cfg_clk, PIO_FIFO_JOIN_RX);
+    int init_clk = pio_sm_init(pio_clk, sm_clk, off_clk, &cfg_clk);
+
+    printf("PIO write capture: base=%d/%d init=%d/%d | SYSCLK base=%d init=%d GP41\n",
+           base_lo,base_hi,init_lo,init_hi,base_clk,init_clk);
+    if (base_lo || base_hi || base_clk || init_lo || init_hi || init_clk) {
         printf("FATAL PIO init failed; DATA remains input.\n");
         while (true) { poll_serial(); sleep_ms(10); }
     }
@@ -226,6 +270,7 @@ int main(void) {
 
     dma_lo = dma_claim_unused_channel(true);
     dma_hi = dma_claim_unused_channel(true);
+    dma_clk = dma_claim_unused_channel(true);
 
     dma_channel_config dc_lo = dma_channel_get_default_config((uint)dma_lo);
     channel_config_set_transfer_data_size(&dc_lo, DMA_SIZE_32);
@@ -239,29 +284,41 @@ int main(void) {
     channel_config_set_write_increment(&dc_hi, true);
     channel_config_set_dreq(&dc_hi, pio_get_dreq(pio_hi, sm_hi, false));
 
+    dma_channel_config dc_clk = dma_channel_get_default_config((uint)dma_clk);
+    channel_config_set_transfer_data_size(&dc_clk, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc_clk, false);
+    channel_config_set_write_increment(&dc_clk, false);
+    channel_config_set_dreq(&dc_clk, pio_get_dreq(pio_clk, sm_clk, false));
+
     pio_sm_set_enabled(pio_lo,sm_lo,false);
     pio_sm_set_enabled(pio_hi,sm_hi,false);
+    pio_sm_set_enabled(pio_clk,sm_clk,false);
     pio_sm_restart(pio_lo,sm_lo);
     pio_sm_restart(pio_hi,sm_hi);
+    pio_sm_restart(pio_clk,sm_clk);
     pio_sm_clear_fifos(pio_lo,sm_lo);
     pio_sm_clear_fifos(pio_hi,sm_hi);
+    pio_sm_clear_fifos(pio_clk,sm_clk);
     pio_interrupt_clear(pio_hi,0);
 
     dma_channel_configure((uint)dma_lo,&dc_lo,low_samples[0],&pio_lo->rxf[sm_lo],SAMPLE_COUNT,false);
     dma_channel_configure((uint)dma_hi,&dc_hi,high_samples[0],&pio_hi->rxf[sm_hi],SAMPLE_COUNT,false);
-    dma_start_channel_mask((1u<<(uint)dma_lo)|(1u<<(uint)dma_hi));
+    dma_channel_configure((uint)dma_clk,&dc_clk,(void *)&master_dma_sink,&pio_clk->rxf[sm_clk],MASTER_DMA_COUNT,false);
+    dma_start_channel_mask((1u<<(uint)dma_lo)|(1u<<(uint)dma_hi)|(1u<<(uint)dma_clk));
+    pio_sm_set_enabled(pio_clk,sm_clk,true);
     pio_sm_set_enabled(pio_hi,sm_hi,true);
     pio_sm_set_enabled(pio_lo,sm_lo,true);
 
     cx4bus_launch_core1();
-    printf("READY TRANSFORM-LINES V5. Power/reset the SNES with Mega Man X2 selected.\n");
+    printf("READY SYSCLK+RESET HYBRID V6. Power/reset the SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {
         /* Drain new authoritative write pairs continuously. This normally makes
            register/RAM writes visible long before the 1024-sample DMA block fills. */
         feed_write_prefix(active_buf);
-        cx4bus_service();
+        master_clock_rearm_if_needed(pio_clk, sm_clk);
+        cx4bus_service(master_clock_ticks());
 
         if (dma_remaining((uint)dma_lo)==0u && dma_remaining((uint)dma_hi)==0u) {
             uint done=active_buf, next=done^1u;
@@ -277,7 +334,8 @@ int main(void) {
             dma_rearms++;
         }
 
-        cx4bus_service();
+        master_clock_rearm_if_needed(pio_clk, sm_clk);
+        cx4bus_service(master_clock_ticks());
         poll_serial();
         tight_loop_contents();
     }

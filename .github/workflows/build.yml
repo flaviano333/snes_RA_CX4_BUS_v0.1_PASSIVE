@@ -1,4 +1,4 @@
-name: Build CX4 BOOTBACK HLE TRANSFORM LINES V5
+name: Build CX4 SYSCLK RESET HYBRID V6
 
 on:
   workflow_dispatch:
@@ -22,13 +22,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi curl
-      - name: Fetch pinned CX4 core for selfcheck only
+      - name: Fetch pinned CX4 core
         run: |
           mkdir -p third_party
           curl -fsSL https://raw.githubusercontent.com/RetroPortingToolKit/snesrecomp/bb37c87/runner/src/snes/cx4.c -o third_party/cx4.c
           curl -fsSL https://raw.githubusercontent.com/RetroPortingToolKit/snesrecomp/bb37c87/runner/src/snes/cx4.h -o third_party/cx4.h
           python3 tools/patch_upstream_cx4.py third_party/cx4.c
-          grep -q "int cx4_load_firmware" third_party/cx4.c
+          grep -q "void cx4_sync" third_party/cx4.c
       - name: Configure
         env:
           PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
@@ -36,9 +36,9 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Rename UF2
-        run: cp build/cx4_bootback_transform_lines_v5.uf2 build/CX4_BOOTBACK_HLE_TRANSFORM_LINES_V5_GENERIC_SEM_ROM.uf2
+        run: cp build/cx4_sysclk_reset_hybrid_v6.uf2 build/CX4_SYSCLK_RESET_HYBRID_V6_GENERIC.uf2
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: CX4-BOOTBACK-HLE-TRANSFORM-LINES-V5
-          path: build/CX4_BOOTBACK_HLE_TRANSFORM_LINES_V5_GENERIC_SEM_ROM.uf2
+          name: CX4-SYSCLK-RESET-HYBRID-V6
+          path: build/CX4_SYSCLK_RESET_HYBRID_V6_GENERIC.uf2
