@@ -11,7 +11,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BOOTBACK HLE BUSY-SYNC V4
+ * CX4 BOOTBACK HLE TRANSFORM-LINES V5
  *
  * Goal: make the CPU-visible CX4 state deterministic for gameplay bring-up.
  * Runtime HG51B LLE is deliberately NOT connected to the CPU-visible C4RAM.
@@ -100,6 +100,7 @@ static volatile uint8_t s_hle_last_sub = 0xffu;
 static volatile uint64_t s_hle_math_jobs = 0;
 static volatile uint64_t s_hle_test_jobs = 0;
 static volatile uint64_t s_hle_unhandled = 0;
+static volatile uint64_t s_hle_lines = 0;
 
 /* Hardware-visible command synchronization. Core1 raises BUSY as soon as it
  * sees a qualified write to $7F4F. Core0 clears BUSY only after the HLE result
@@ -369,6 +370,102 @@ static inline uint32_t rd24u(const uint8_t *p) {
 static inline void wr24(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16);
 }
+
+static inline int iabs16(int v) { return v < 0 ? -v : v; }
+
+/* Exact Snes9x C4 Transform-Lines path ($7F4F=$00, $7F4D=$05), adapted
+ * to the isolated 8 KiB C4 RAM. This operation is self-contained: it uses
+ * only C4 RAM and does not dereference game-ROM pointers. */
+static void hle_calc_wireframe(int16_t x1, int16_t y1, int16_t x2, int16_t y2,
+                               int16_t *stepx, int16_t *stepy, int16_t *dist) {
+    int dx = (int)x2 - (int)x1;
+    int dy = (int)y2 - (int)y1;
+    int adx = iabs16(dx), ady = iabs16(dy);
+    if (adx > ady) {
+        *dist = (int16_t)(adx + 1);
+        *stepy = adx ? (int16_t)(256.0 * (double)dy / (double)adx) : 0;
+        *stepx = (int16_t)(dx < 0 ? -256 : 256);
+    } else if (ady != 0) {
+        *dist = (int16_t)(ady + 1);
+        *stepx = (int16_t)(256.0 * (double)dx / (double)ady);
+        *stepy = (int16_t)(dy < 0 ? -256 : 256);
+    } else {
+        *dist = 0; *stepx = 0; *stepy = 0;
+    }
+}
+
+static void hle_transform_wireframe(int16_t *xv, int16_t *yv, int16_t zv,
+                                    int16_t rx, int16_t ry, int16_t rz,
+                                    int16_t scale) {
+    const double pi = 3.14159265;
+    double x = (double)*xv;
+    double y = (double)*yv;
+    double z = (double)zv - 0x95;
+    double a = -(double)rx * pi * 2.0 / 128.0;
+    double y2 = y * cos(a) - z * sin(a);
+    double z2 = y * sin(a) + z * cos(a);
+    a = -(double)ry * pi * 2.0 / 128.0;
+    double x2 = x * cos(a) + z2 * sin(a);
+    z = x * -sin(a) + z2 * cos(a);
+    a = -(double)rz * pi * 2.0 / 128.0;
+    x = x2 * cos(a) - y2 * sin(a);
+    y = x2 * sin(a) + y2 * cos(a);
+    double denom = 0x90 * (z + 0x95);
+    if (fabs(denom) < 1e-12) {
+        *xv = 0; *yv = 0;
+    } else {
+        *xv = (int16_t)(x * (double)scale / denom * 0x95);
+        *yv = (int16_t)(y * (double)scale / denom * 0x95);
+    }
+}
+
+static void hle_transform_lines(void) {
+    int16_t rx = (int16_t)s_c4ram[0x1f83u];
+    int16_t ry = (int16_t)s_c4ram[0x1f86u];
+    int16_t rz = (int16_t)s_c4ram[0x1f89u];
+    int16_t scale = (int16_t)s_c4ram[0x1f8cu];
+    uint16_t vertices = rd16(&s_c4ram[0x1f80u]);
+    if (vertices > 0x200u) vertices = 0x200u; /* C4 RAM safety only. */
+
+    uint32_t ptr = 0;
+    for (uint16_t i = 0; i < vertices && ptr + 10u < 0x2000u; ++i, ptr += 0x10u) {
+        int16_t x = (int16_t)rd16(&s_c4ram[ptr + 1u]);
+        int16_t y = (int16_t)rd16(&s_c4ram[ptr + 5u]);
+        int16_t z = (int16_t)rd16(&s_c4ram[ptr + 9u]);
+        hle_transform_wireframe(&x, &y, z, rx, ry, rz, scale);
+        wr16(&s_c4ram[ptr + 1u], (uint16_t)(int16_t)(x + 0x80));
+        wr16(&s_c4ram[ptr + 5u], (uint16_t)(int16_t)(y + 0x50));
+    }
+
+    wr16(&s_c4ram[0x600u], 23u);
+    wr16(&s_c4ram[0x602u], 0x60u);
+    wr16(&s_c4ram[0x605u], 0x40u);
+    wr16(&s_c4ram[0x608u], 23u);
+    wr16(&s_c4ram[0x60au], 0x60u);
+    wr16(&s_c4ram[0x60du], 0x40u);
+
+    uint16_t lines = rd16(&s_c4ram[0xb00u]);
+    if (lines > 0x100u) lines = 0x100u;
+    uint32_t lp = 0xb02u;
+    uint32_t out = 0x600u;
+    for (uint16_t i = 0; i < lines && lp + 1u < 0x2000u && out + 6u < 0x2000u;
+         ++i, lp += 2u, out += 8u) {
+        uint8_t a = s_c4ram[lp], b = s_c4ram[lp + 1u];
+        uint32_t pa = ((uint32_t)a) << 4, pb = ((uint32_t)b) << 4;
+        if (pa + 6u >= 0x2000u || pb + 6u >= 0x2000u) break;
+        int16_t x1 = (int16_t)rd16(&s_c4ram[pa + 1u]);
+        int16_t y1 = (int16_t)rd16(&s_c4ram[pa + 5u]);
+        int16_t x2 = (int16_t)rd16(&s_c4ram[pb + 1u]);
+        int16_t y2 = (int16_t)rd16(&s_c4ram[pb + 5u]);
+        int16_t sx, sy, dist;
+        hle_calc_wireframe(x1, y1, x2, y2, &sx, &sy, &dist);
+        wr16(&s_c4ram[out + 0u], (uint16_t)(dist ? dist : 1));
+        wr16(&s_c4ram[out + 2u], (uint16_t)sx);
+        wr16(&s_c4ram[out + 5u], (uint16_t)sy);
+    }
+    s_hle_lines++;
+}
+
 static void hle_math_command(uint8_t cmd) {
     const double pi = 3.14159265358979323846;
     switch (cmd) {
@@ -537,11 +634,19 @@ static void hle_on_command(uint16_t off, uint8_t data) {
         }
     }
 
-    if (data == 0x00u && s_hle_last_sub == 0x00u) {
-        (void)hle_conv_oam();
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        hle_busy_clear();
-        return;
+    if (data == 0x00u) {
+        if (s_hle_last_sub == 0x00u) {
+            (void)hle_conv_oam();
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            hle_busy_clear();
+            return;
+        }
+        if (s_hle_last_sub == 0x05u) {
+            hle_transform_lines();
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            hle_busy_clear();
+            return;
+        }
     }
 
     /* Low-risk arithmetic subset; complex drawing effects remain untouched. */
@@ -568,7 +673,7 @@ static void clear_runtime_state(void) {
     s_hle_jobs = s_hle_good_jobs = s_hle_rejected_jobs = 0;
     s_hle_groups = s_hle_oam = s_hle_longparts = s_hle_zero_ptr = 0;
     s_hle_pmax = 0; s_hle_last_ptr = 0; s_hle_last_sub = 0xffu;
-    s_hle_math_jobs = s_hle_test_jobs = s_hle_unhandled = 0;
+    s_hle_math_jobs = s_hle_test_jobs = s_hle_unhandled = s_hle_lines = 0;
     __atomic_store_n(&s_hle_busy, 0u, __ATOMIC_RELEASE);
     s_busy_arms = s_busy_clears = s_busy_status_reads = s_busy_rearms = 0;
     s_unhandled_last_cmd = s_unhandled_last_sub = 0xffu;
@@ -722,14 +827,14 @@ void cx4bus_selfcheck(void) {
 }
 
 void cx4bus_print_status(void) {
-    printf("CX4STAT mode=BOOTBACK_HLE_BUSY_SYNC_V4 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
-           "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X busy=%u busy_arm=%llu busy_clear=%llu busy_reads=%llu busy_rearm=%llu unh_last=%02X/%02X "
+    printf("CX4STAT mode=BOOTBACK_HLE_TRANSFORM_LINES_V5 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
+           "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_lines=%llu hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X busy=%u busy_arm=%llu busy_clear=%llu busy_reads=%llu busy_rearm=%llu unh_last=%02X/%02X "
            "inv625_bad=%llu inv629_bad=%llu inv627_bad=%llu inv_last=%02X/%02X/%02X/%04X "
            "pio_w=%llu pio_ram=%llu pio_io=%llu cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_rom_slot_valid?1u:0u,
            (unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
            (unsigned long long)s_hle_jobs,(unsigned long long)s_hle_good_jobs,(unsigned long long)s_hle_rejected_jobs,
-           (unsigned long long)s_hle_groups,(unsigned long long)s_hle_oam,(unsigned long long)s_hle_math_jobs,(unsigned long long)s_hle_test_jobs,(unsigned long long)s_hle_unhandled,(unsigned long)s_hle_pmax,
+           (unsigned long long)s_hle_groups,(unsigned long long)s_hle_oam,(unsigned long long)s_hle_math_jobs,(unsigned long long)s_hle_test_jobs,(unsigned long long)s_hle_unhandled,(unsigned long long)s_hle_lines,(unsigned long)s_hle_pmax,
            (unsigned long long)s_hle_longparts,(unsigned long long)s_hle_zero_ptr,(unsigned long)s_hle_last_ptr,s_hle_last_sub,
            hle_busy_get()?1u:0u,(unsigned long long)s_busy_arms,(unsigned long long)s_busy_clears,(unsigned long long)s_busy_status_reads,(unsigned long long)s_busy_rearms,s_unhandled_last_cmd,s_unhandled_last_sub,
            (unsigned long long)s_inv625_bad,(unsigned long long)s_inv629_bad,(unsigned long long)s_inv627_bad,
