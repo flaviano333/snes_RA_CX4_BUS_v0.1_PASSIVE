@@ -1,4 +1,4 @@
-name: Build BUS VALIDATOR v0.8 PHI2-WINDOW
+name: Build BUS VALIDATOR v0.9 SAFE ONE-PASS
 on:
   workflow_dispatch:
   push:
@@ -23,8 +23,8 @@ jobs:
         run: cmake -S . -B build -G Ninja
       - name: Build
         run: cmake --build build
-      - run: cp build/snes_rp2350b_bus_validator.uf2 build/BUS_VALIDATOR_v0.8_PHI2_WINDOW.uf2
+      - run: cp build/snes_rp2350b_bus_validator.uf2 build/BUS_VALIDATOR_v0.9_SAFE_ONEPASS.uf2
       - uses: actions/upload-artifact@v4
         with:
-          name: bus-validator-v0.8-phi2-window
-          path: build/BUS_VALIDATOR_v0.8_PHI2_WINDOW.uf2
+          name: bus-validator-v0.9-safe-onepass
+          path: build/BUS_VALIDATOR_v0.9_SAFE_ONEPASS.uf2

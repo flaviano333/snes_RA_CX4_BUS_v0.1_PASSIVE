@@ -1108,7 +1108,7 @@ static void execute_command(char *line) {
         cx4bus_selfcheck();
     } else if (!strcmp(cmd, "BUSARM")) {
         cx4bus_arm(true);
-        printf("OK BUS readback requested. Drive remains gated until BUS6 test ROM magic is seen.\n");
+        printf("OK BUS one-pass readback armed. Max 4096 target reads; auto-disarms after one completed pass.\n");
     } else if (!strcmp(cmd, "BUSDISARM")) {
         cx4bus_arm(false);
         printf("OK BUS readback disabled; D0-D7 released to INPUT.\n");
@@ -1248,7 +1248,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + BUS VALIDATOR v0.8.1 PHI2-WINDOW + HOLD ===\n");
+    printf("\n=== SNES RP2350B RA + BUS VALIDATOR v0.9 SAFE ONE-PASS ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
@@ -1385,7 +1385,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; BUS VALIDATOR v0.8.1 PHI2-WINDOW + HOLD available; drive starts OFF.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; BUS VALIDATOR v0.9 SAFE ONE-PASS available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 

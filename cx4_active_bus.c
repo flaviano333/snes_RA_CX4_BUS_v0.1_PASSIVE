@@ -7,7 +7,7 @@
 #include "hardware/structs/sio.h"
 
 /*
- * v0.8.1 PHI2-WINDOW + READ-HOLD RESPONDER
+ * v0.9 DOUBLE-SAMPLE + FIXED-HOLD ONE-PASS RESPONDER
  *
  * This deliberately does NOT emulate CX4. It validates the electrical/data
  * path with a deterministic test ROM. PIO+DMA is authoritative for writes.
@@ -38,8 +38,13 @@ static volatile uint8_t s_first_bad_data=0, s_first_bad_expected_data=0;
 static volatile uint32_t s_reg_index=0, s_reg_bad=0;
 static volatile uint16_t s_read_errors=0xffffu, s_last_read_errors=0xffffu;
 static volatile uint64_t s_read_pass_good=0, s_read_pass_bad=0;
-static volatile uint64_t s_hold_wait=0, s_hold_timeout=0;
+static volatile uint64_t s_fixed_hold=0, s_hold_abort=0;
 static volatile uint64_t s_sample_target=0, s_sample_match=0, s_sample_bad=0;
+static volatile uint64_t s_addr_double=0, s_addr_unstable=0, s_too_late=0;
+static volatile uint64_t s_echo_target=0, s_echo_match=0, s_echo_bad=0;
+static volatile uint64_t s_auto_disarm=0, s_budget_cut=0;
+static volatile uint32_t s_drive_budget=0;
+static volatile bool s_arm_wait_pass=false;
 static volatile uint16_t s_sample_last_off=0; static volatile uint8_t s_sample_last_got=0, s_sample_last_exp=0;
 static volatile uint16_t s_expected_off=0x6000u;
 static volatile uint16_t s_last_off=0; static volatile uint8_t s_last_data=0;
@@ -83,7 +88,10 @@ static void clear_state(void){
     s_write_bad_data_total=s_write_bad_addr_total=s_write_missing_total=s_write_extra_total=0;
     s_first_bad_exp=s_first_bad_got=0xffffffffu; s_first_bad_data=s_first_bad_expected_data=0;
     s_reg_index=s_reg_bad=0; s_read_errors=0xffffu; s_last_read_errors=0xffffu; s_read_pass_good=s_read_pass_bad=0;
-    s_hold_wait=s_hold_timeout=0; s_sample_target=s_sample_match=s_sample_bad=0;
+    s_fixed_hold=s_hold_abort=0; s_sample_target=s_sample_match=s_sample_bad=0;
+    s_addr_double=s_addr_unstable=s_too_late=0;
+    s_echo_target=s_echo_match=s_echo_bad=0; s_auto_disarm=s_budget_cut=0;
+    s_drive_budget=0; s_arm_wait_pass=false;
     s_sample_last_off=0; s_sample_last_got=s_sample_last_exp=0; s_expected_off=0x6000u;
     s_last_off=0; s_last_data=0;
 }
@@ -94,36 +102,49 @@ void cx4bus_init(void){
     for(unsigned i=0;i<8;i++){ gpio_set_function(pins[i],GPIO_FUNC_SIO); gpio_set_dir(pins[i],GPIO_IN); gpio_disable_pulls(pins[i]); }
     data_release();
 }
-void cx4bus_arm(bool e){ s_arm_request=e; if(!e)data_release(); }
+void cx4bus_arm(bool e){
+    s_arm_request=e;
+    if(e){
+        /* One BUSARM is deliberately limited to one test pass (plus a hard
+           4096-read ceiling) so a decode/timing bug cannot drive the bus for
+           minutes.  The fixed ROM performs 3072 target reads per pass. */
+        s_drive_budget=4096u;
+        s_arm_wait_pass=true;
+    }else{
+        s_drive_budget=0;
+        s_arm_wait_pass=false;
+        data_release();
+    }
+}
 bool cx4bus_is_armed(void){ return s_arm_request; }
 void cx4bus_reset_state(void){ s_reset_requested=true; }
 
 static void __not_in_flash_func(core1_loop)(void){
     /*
-     * v0.8: qualify the response inside the PHI2-high window.
+     * v0.9: safety-first active-read validator.
      *
-     * SNES cartridge timing guarantees that the CPU A-bus address is stable
-     * while PHI2 is high, and read data only has to be valid at the falling
-     * edge of PHI2.  v0.7 instead sampled the address immediately after /RD
-     * fell; on hardware this caught only a tiny fraction of $6000-$6BFF reads.
+     * The v0.8.1 experiment proved that waiting for /RD to rise after PHI2
+     * could keep D0-D7 driven into a later bus cycle and stall/crash the test
+     * ROM.  This version never uses /RD release as the output-disable event.
      *
-     * Sequence per bus cycle:
-     *   1. wait for PHI2 rising edge;
-     *   2. sample the now-stable address;
-     *   3. if the address is our deliberately gated test window, wait for /RD
-     *      to assert at any point during PHI2 high (not just at one instant);
-     *   4. drive the preselected byte and KEEP it valid through PHI2 falling;
-     *   5. immediately return D0-D7 to input.
+     * Per read cycle:
+     *   1. wait for PHI2 rising;
+     *   2. wait for /RD to assert while PHI2 is still high;
+     *   3. sample A0-A23 twice and require both samples to agree;
+     *   4. require /WR=1, bank $00, address $6000-$6BFF;
+     *   5. drive the already-captured RAM byte;
+     *   6. verify the physical GPIO level while we are actively driving;
+     *   7. wait for PHI2 falling, hold for a short fixed number of RP cycles,
+     *      then release D0-D7 regardless of /RD state.
      *
-     * This remains a validator, not CX4 emulation.  It drives only bank $00,
-     * $6000-$6BFF, after BUS6 magic and BUSARM.
+     * BUSARM is additionally capped to 4096 driven reads and is auto-cleared
+     * after one completed test-ROM pass.  This is intentionally conservative.
      */
     s_core1_started=true;
     data_release();
     bool prev_phi = (sio_hw->gpio_in & PHI2_MASK) != 0u;
 
     for(;;){
-        /* Find a real low -> high PHI2 edge. */
         bool phi;
         do {
             phi = (sio_hw->gpio_in & PHI2_MASK) != 0u;
@@ -132,65 +153,90 @@ static void __not_in_flash_func(core1_loop)(void){
         prev_phi=true;
         s_phi_cycles++;
 
-        /* Address is guaranteed stable during PHI2 high. */
-        uint32_t lo=sio_hw->gpio_in;
-        uint32_t hi=sio_hw->gpio_hi_in;
-        uint32_t a=raw_address24(lo,hi);
-        bool target = s_arm_request && s_magic &&
-                      ((a>>16)==0x00u) &&
-                      ((uint16_t)a>=0x6000u) && ((uint16_t)a<=0x6bffu);
-        if(target) s_phi_target++;
-
         bool saw_rd = ((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u);
-        /* /RD may assert after PHI2 has already risen.  Wait for it, but only
-           while the same PHI2-high bus window remains active. */
-        while(!saw_rd && ((sio_hw->gpio_in & PHI2_MASK) != 0u)) {
+        while(!saw_rd && ((sio_hw->gpio_in & PHI2_MASK) != 0u)){
             saw_rd = ((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u);
         }
+        if(!saw_rd){
+            prev_phi=false;
+            continue;
+        }
+        s_rd_edges++;
+        s_phi_rd++;
 
-        if(saw_rd){
-            s_rd_edges++;
-            s_phi_rd++;
-            if(s_arm_request && s_magic){
-                if((a>>16)!=0x00u){
-                    s_rd_bank_miss++;
-                }else if((uint16_t)a<0x6000u || (uint16_t)a>0x6bffu){
-                    s_rd_range_miss++;
-                }else{
-                    uint16_t off=(uint16_t)a;
-                    uint8_t v=s_ram[off-0x6000u];
-                    s_cpu_r++;
-                    s_rd_safe++;
-                    s_phi_target_rd++;
-                    s_last_off=off;
-                    s_last_data=v;
-                    data_drive(v);
-                    s_driven++;
-                }
-            }
-        }else if(target){
-            s_phi_no_rd++;
+        /* Sample the address only after /RD is active, then sample it again.
+           A disagreement means the bus is transitioning: do not drive. */
+        uint32_t lo1=sio_hw->gpio_in;
+        uint32_t hi1=sio_hw->gpio_hi_in;
+        uint32_t a1=raw_address24(lo1,hi1);
+        __asm volatile("nop\n nop\n");
+        uint32_t lo2=sio_hw->gpio_in;
+        uint32_t hi2=sio_hw->gpio_hi_in;
+        uint32_t a2=raw_address24(lo2,hi2);
+        s_addr_double++;
+        if(a1!=a2){
+            s_addr_unstable++;
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
         }
 
-        /* Data must remain valid through the sampling edge *and* for the
-           cartridge-bus hold interval after PHI2 falls.  v0.8 released the
-           bus immediately on the falling edge, which can be too early for
-           the 5A22/input path.  Keep driving until /RD is released.  A hard
-           loop bound prevents a stuck /RD from leaving the RP driving forever. */
-        while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
-        if(s_driving){
-            uint32_t hold=0;
-            while((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u && hold < 256u){
-                ++hold;
-                tight_loop_contents();
-            }
-            s_hold_wait += hold;
-            if((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u) s_hold_timeout++;
+        uint32_t a=a2;
+        bool wr_high = (lo2 & (1u << PIN_WR)) != 0u;
+        if(!s_arm_request || !s_magic || !wr_high){
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
+        if((a>>16)!=0x00u){
+            s_rd_bank_miss++;
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
+        uint16_t off=(uint16_t)a;
+        if(off<0x6000u || off>0x6bffu){
+            s_rd_range_miss++;
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
+        if((sio_hw->gpio_in & PHI2_MASK)==0u){
+            s_too_late++;
+            prev_phi=false;
+            continue;
+        }
+        if(s_drive_budget==0u){
+            s_budget_cut++;
+            s_arm_request=false;
             data_release();
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
         }
 
-        /* If /RD only became visible after PHI2 fell, count it as late. */
-        if(target && !saw_rd && ((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u)) s_phi_late++;
+        uint8_t v=s_ram[off-0x6000u];
+        s_cpu_r++; s_rd_safe++; s_phi_target++; s_phi_target_rd++;
+        s_last_off=off; s_last_data=v;
+        data_drive(v);
+        s_driven++;
+        s_drive_budget--;
+
+        /* Electrical echo while OE is definitely asserted.  Unlike the PIO
+           read sample, this cannot accidentally happen after data_release(). */
+        __asm volatile("nop\n nop\n nop\n");
+        uint8_t echo=raw_data(sio_hw->gpio_in);
+        s_echo_target++;
+        if(echo==v) s_echo_match++; else s_echo_bad++;
+
+        while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+
+        /* Short deterministic post-edge hold.  Do NOT wait for /RD to rise:
+           /RD can remain asserted across adjacent reads and that previously
+           caused the RP to corrupt the following bus cycle. */
+        __asm volatile("nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n");
+        s_fixed_hold++;
+        data_release();
         prev_phi=false;
     }
 }
@@ -234,6 +280,12 @@ static void mailbox(uint16_t off,uint8_t data){
         s_last_read_errors=s_read_errors;
         if(s_last_read_errors==0u) s_read_pass_good++; else s_read_pass_bad++;
         s_read_passes++; s_passes++;
+        if(s_arm_request && s_arm_wait_pass){
+            s_arm_request=false;
+            s_arm_wait_pass=false;
+            s_drive_budget=0;
+            s_auto_disarm++;
+        }
     }
 }
 
@@ -285,12 +337,12 @@ void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=
 void cx4bus_print_runs(void){ printf("BUSREG seq=%u index=%lu bad=%lu expected=7F49:00 7F4A:80 7F4B:02 7F4D:0E 7F4E:00 7F4F:5C\n",s_seq,(unsigned long)s_reg_index,(unsigned long)s_reg_bad); }
 void cx4bus_selfcheck(void){ printf("BUSTEST ROM expected: test_rom/CX4_BUS_TEST.sfc (no injected game ROM required)\n"); }
 void cx4bus_print_status(void){
-    printf("BUSSTAT mode=BUS_VALIDATOR_V0.8.1_HOLD arm=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
+    printf("BUSSTAT mode=BUS_VALIDATOR_V0.9_SAFE_ONEPASS arm=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
            "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu bad_data_total=%llu bad_addr_total=%llu missing_total=%llu extra_total=%llu "
            "reg_passes=%llu reg_index=%lu reg_bad=%lu read_passes=%llu cur_err=%u last_err=%u read_good=%llu read_bad=%llu "
-           "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu phi_target=%llu phi_rd=%llu phi_target_rd=%llu phi_no_rd=%llu phi_late=%llu "
-           "rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu cpu_r=%llu driven=%llu hold_wait=%llu hold_to=%llu "
-           "sample_target=%llu sample_match=%llu sample_bad=%llu sample_last=%04X:%02X/%02X "
+           "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu "
+           "addr2=%llu unstable=%llu too_late=%llu cpu_r=%llu driven=%llu budget=%lu budget_cut=%llu auto_disarm=%llu fixed_hold=%llu "
+           "echo=%llu/%llu bad=%llu sample=%llu/%llu bad=%llu sample_last=%04X:%02X/%02X "
            "first_bad=%04lX/%04lX:%02X/%02X last=%04X:%02X\n",
            s_arm_request?1u:0u,(s_arm_request&&s_magic)?1u:0u,s_driving?"ON":"OFF",s_magic?1u:0u,s_seq,s_phase,
            (unsigned long long)s_passes,(unsigned long long)s_write_passes,(unsigned long)s_write_seen,
@@ -301,12 +353,13 @@ void cx4bus_print_status(void){
            (unsigned long long)s_read_passes,(unsigned)s_read_errors,(unsigned)s_last_read_errors,
            (unsigned long long)s_read_pass_good,(unsigned long long)s_read_pass_bad,
            s_magic_mask,(unsigned long long)s_magic_hits,(unsigned long long)s_magic_bad,(unsigned long long)s_pio_w,
-           (unsigned long long)s_phi_cycles,(unsigned long long)s_phi_target,(unsigned long long)s_phi_rd,
-           (unsigned long long)s_phi_target_rd,(unsigned long long)s_phi_no_rd,(unsigned long long)s_phi_late,
-           (unsigned long long)s_rd_edges,(unsigned long long)s_rd_safe,(unsigned long long)s_rd_bank_miss,
-           (unsigned long long)s_rd_range_miss,(unsigned long long)s_cpu_r,(unsigned long long)s_driven,
-           (unsigned long long)s_hold_wait,(unsigned long long)s_hold_timeout,
-           (unsigned long long)s_sample_target,(unsigned long long)s_sample_match,(unsigned long long)s_sample_bad,
+           (unsigned long long)s_phi_cycles,(unsigned long long)s_rd_edges,(unsigned long long)s_rd_safe,
+           (unsigned long long)s_rd_bank_miss,(unsigned long long)s_rd_range_miss,
+           (unsigned long long)s_addr_double,(unsigned long long)s_addr_unstable,(unsigned long long)s_too_late,
+           (unsigned long long)s_cpu_r,(unsigned long long)s_driven,(unsigned long)s_drive_budget,
+           (unsigned long long)s_budget_cut,(unsigned long long)s_auto_disarm,(unsigned long long)s_fixed_hold,
+           (unsigned long long)s_echo_match,(unsigned long long)s_echo_target,(unsigned long long)s_echo_bad,
+           (unsigned long long)s_sample_match,(unsigned long long)s_sample_target,(unsigned long long)s_sample_bad,
            s_sample_last_off,s_sample_last_got,s_sample_last_exp,
            (unsigned long)s_first_bad_exp,(unsigned long)s_first_bad_got,s_first_bad_data,s_first_bad_expected_data,
            s_last_off,s_last_data);
