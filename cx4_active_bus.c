@@ -7,7 +7,7 @@
 #include "bus_drive.pio.h"
 
 /*
- * BUS VALIDATOR v1.0.7 SPLIT-PIO-DIRECT
+ * BUS VALIDATOR v1.0.8 READ-ONLY-SETTLED
  *
  * This is intentionally NOT a CX4 emulator.  It is the final electrical
  * readback validator.  The companion ROM writes/reads $00:6000-$6BFF with
@@ -144,7 +144,7 @@ void cx4bus_init(void){
     sm_config_set_in_pins(&c_lo, 11);      /* A0 at GP11 */
     sm_config_set_out_pins(&c_lo, 2, 3);   /* D0..D2 */
     sm_config_set_set_pins(&c_lo, 2, 3);
-    sm_config_set_jmp_pin(&c_lo, PIN_PHI2);
+    sm_config_set_jmp_pin(&c_lo, 1);      /* GP1 = /WR, must be HIGH to drive */
     sm_config_set_in_shift(&c_lo, false, false, 32); /* shift left: sampled bits stay in LSBs */
     sm_config_set_out_shift(&c_lo, true, false, 32);
 
@@ -152,7 +152,7 @@ void cx4bus_init(void){
     sm_config_set_in_pins(&c_hi, 14);      /* A3 at GP14 */
     sm_config_set_out_pins(&c_hi, 6, 5);   /* D3..D7 */
     sm_config_set_set_pins(&c_hi, 6, 5);
-    sm_config_set_jmp_pin(&c_hi, PIN_PHI2);
+    sm_config_set_jmp_pin(&c_hi, 1);      /* GP1 = /WR, must be HIGH to drive */
     sm_config_set_in_shift(&c_hi, false, false, 32);
     sm_config_set_out_shift(&c_hi, true, false, 32);
 
@@ -173,7 +173,7 @@ void cx4bus_init(void){
            s_drive_sm_lo,s_drive_sm_hi,s_drive_off,rc_lo,rc_hi,s_drive_ready?1u:0u);
 }
 
-/* No latency-critical CPU loop exists in v1.0.7. Kept for main.c compatibility. */
+/* No latency-critical CPU loop exists in v1.0.8. Kept for main.c compatibility. */
 void cx4bus_launch_core1(void){ }
 
 void cx4bus_arm(bool e){
@@ -204,7 +204,7 @@ static void finish_write_phase(void){
 
 static void mailbox(uint16_t off,uint8_t data){
     if(off>=0x7ff0u && off<=0x7ff3u){
-        const uint8_t m[4]={'B','U','S','7'};
+        const uint8_t m[4]={'B','U','S','8'};
         uint8_t idx=(uint8_t)(off-0x7ff0u);
         if(data==m[idx]){
             s_magic_mask |= (uint8_t)(1u<<idx);
@@ -233,6 +233,19 @@ static void mailbox(uint16_t off,uint8_t data){
     }else if(data==0x30u){
         s_phase=0x30u;
         if(s_reg_index==6u && s_reg_bad==0u) s_reg_passes++;
+
+        /* v1.0.8: BUSARM opens the responder only for the READ phase.
+           The bundled BUS8 ROM deliberately pauses after this marker, giving
+           the DMA/mailbox scanner ample time to enable the PIO responders
+           before the first $6000 read. */
+        if(s_arm_pending){
+            s_arm_pending=false;
+            s_arm_request=true;
+            s_arm_wait_pass=true;
+            s_active_last_err=0xffffu;
+            s_active_good_bytes=0;
+            drive_hw_on();
+        }
     }else if(data==0x40u){
         s_phase=0x40u;
         s_last_read_errors=s_read_errors;
@@ -250,17 +263,6 @@ static void mailbox(uint16_t off,uint8_t data){
             drive_hw_off();
         }
 
-        /* BUSARM is deliberately activated at the END of the preceding pass.
-           The entire next WRITE+REG phase gives the delayed PIO+DMA mailbox
-           scanner ample time before the first target read. */
-        if(s_arm_pending){
-            s_arm_pending=false;
-            s_arm_request=true;
-            s_arm_wait_pass=true;
-            s_active_last_err=0xffffu;
-            s_active_good_bytes=0;
-            drive_hw_on();
-        }
     }
 }
 
@@ -327,7 +329,7 @@ void cx4bus_print_runs(void){
 }
 
 void cx4bus_selfcheck(void){
-    printf("BUSTEST v1.0.7 requires bundled test_rom/CX4_BUS_TEST.sfc (BUS7, DATA=A0..A7)\n");
+    printf("BUSTEST v1.0.8 requires bundled test_rom/CX4_BUS_TEST.sfc (BUS8, READ-only drive, DATA=A0..A7)\n");
 }
 
 void cx4bus_print_status(void){
@@ -335,7 +337,7 @@ void cx4bus_print_status(void){
     uint irq2=pio_interrupt_get(s_drive_pio, 2)?1u:0u;
     uint irq3=pio_interrupt_get(s_drive_pio, 3)?1u:0u;
 
-    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.7_SPLIT_PIO_DIRECT verdict=%s "
+    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.8_READ_ONLY_SETTLED verdict=%s "
            "arm=%u pending=%u drive=%s ready=%u windows=%llu forced_off=%llu irq=%u/%u "
            "magic=%u seq=%u phase=%02X passes=%llu "
            "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu "
@@ -343,7 +345,7 @@ void cx4bus_print_status(void){
            "reg_passes=%llu reg_index=%lu reg_bad=%lu "
            "read_passes=%llu cur_err=%u last_err=%u read_good=%llu read_bad=%llu "
            "active_passes=%llu active_last_err=%u active_good_bytes=%lu/3072 active_good=%llu active_bad=%llu "
-           "guard=ROMSEL_HIGH+WRAMSEL_HIGH_PIO data=A0-A7_DIRECT magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu "
+           "guard=RD+ROMSEL_SETTLED_HIGH+WRAMSEL_HIGH+WR_HIGH data=A0-A7_DIRECT window=READ_ONLY magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu "
            "first_bad=%04lX/%04lX:%02X/%02X last=%04X:%02X\n",
            ready?"READY_FOR_GAME":"NOT_YET",
            s_arm_request?1u:0u,s_arm_pending?1u:0u,s_drive_enabled?"ON":"OFF",s_drive_ready?1u:0u,

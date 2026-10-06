@@ -2,16 +2,17 @@
 .program snes_read_trigger
 ; RP2350B PIO2, GPIO base = 16
 ;
-; SM0: physical /RD detector + /ROMSEL first-stage gate.
+; SM0: physical /RD detector + settled /ROMSEL first-stage gate.
 ;   GP35 /RD     -> WAIT GPIO index 19 (35-16)
 ;   GP38 /ROMSEL -> JMP PIN configured by C
 ;
-; A LOW /ROMSEL is a genuine cartridge-ROM access. Such a cycle is never
+; After a short settle delay, LOW /ROMSEL is a genuine cartridge-ROM access. Such a cycle is never
 ; forwarded to the active responder. A HIGH /ROMSEL read raises local PIO2
 ; IRQ4 for SM1 to apply the /WRAMSEL gate.
 .wrap_target
 rd_loop:
     wait 0 gpio 19
+    nop [3]                 ; allow /ROMSEL to settle after /RD falls
     jmp pin romsel_open
     jmp rd_release
 romsel_open:

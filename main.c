@@ -733,7 +733,7 @@ static void print_help(void) {
     printf("  BUSTRACE                show last bus-test access/phase\n");
     printf("  BUSREG                  show register-sequence validation\n");
     printf("  BUSTEST                 show expected test ROM name\n");
-    printf("  BUSARM                  enable readback ONLY for BUS7 test ROM $00:6000-$6BFF\n");
+    printf("  BUSARM                  enable readback ONLY for BUS8 test ROM $00:6000-$6BFF\n");
     printf("  BUSDISARM               disable active response; D0-D7 immediately INPUT\n");
     printf("  BUSRESET                clear validator state without changing arm request\n");
     printf("  PING                    reply PONG\n");
@@ -1106,7 +1106,7 @@ static void execute_command(char *line) {
         cx4bus_selfcheck();
     } else if (!strcmp(cmd, "BUSARM")) {
         cx4bus_arm(true);
-        printf("OK BUS one-pass queued. It will pre-arm at the END of the current pass, then validate the NEXT complete READ pass.\n");
+        printf("OK BUS one-pass queued. It will enable D0-D7 only when the next BUS8 pass reaches phase READ ($7FF5=30).\n");
     } else if (!strcmp(cmd, "BUSDISARM")) {
         cx4bus_arm(false);
         printf("OK BUS readback disabled; D0-D7 released to INPUT.\n");
@@ -1246,14 +1246,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B BUS VALIDATOR v1.0.7 SPLIT-PIO-DIRECT ===\n");
+    printf("\n=== SNES RP2350B BUS VALIDATOR v1.0.8 READ-ONLY-SETTLED ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
     printf("A11..A13=GP23..25; GP26=SKIP; A14..A21=GP27..34; /RD=GP35.\n");
     printf("A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39.\n");
     printf("GP39=/WRAMSEL is ACTIVE in v2.0; GP40 remains A10.\n");
-    printf("Type HELP for commands. BUS readback starts DISARMED and is gated by the bundled BUS7 test ROM magic.\n\n");
+    printf("Type HELP for commands. BUS readback starts DISARMED and is gated by the bundled BUS8 test ROM magic; drive is READ-phase only.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 40; ++pin) {
@@ -1359,13 +1359,13 @@ int main(void) {
     cx4_pio_write_scan_pos[0] = cx4_pio_write_scan_pos[1] = 0;
     cx4_pio_write_scan_total = 0;
 
-    // v1.0.7 intentionally does not allocate the passive READ DMA pipeline.
+    // v1.0.8 intentionally does not allocate the passive READ DMA pipeline.
     // PIO0 SM2+SM3 are reserved for the split direct responder during BUSARM.
     cx4_dma_read_lo = -1;
     cx4_dma_read_hi = -1;
     cx4_active_read_buf = 0;
 
-    printf("READY. BUS VALIDATOR v1.0.7 SPLIT-PIO-DIRECT available; drive starts OFF.\n");
+    printf("READY. BUS VALIDATOR v1.0.8 READ-ONLY-SETTLED available; drive starts OFF.\n");
     printf("Use BUSRESET, BUSSTAT, BUSARM, BUSOFF, BUSTRACE or BUSTEST for this final validator.\n\n");
     fflush(stdout);
 
@@ -1398,7 +1398,7 @@ int main(void) {
     pio_sm_set_enabled(pio_rd, sm_drive_qualifier, true);
     pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
 
-    // v1.0.7 has no latency-critical CPU responder; the compatibility call is a no-op.
+    // v1.0.8 has no latency-critical CPU responder; the compatibility call is a no-op.
     cx4bus_launch_core1();
 
     uint write_buf = 0;

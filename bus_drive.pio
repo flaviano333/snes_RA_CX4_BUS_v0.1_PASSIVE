@@ -11,13 +11,14 @@
 ;
 ; WAIT IRQ 0 REL maps to IRQ2 on SM2 and IRQ3 on SM3. PIO2 only publishes
 ; those IRQs when /RD is LOW, /ROMSEL is HIGH and /WRAMSEL is HIGH.
-; Both SMs remain disabled except for the single BUSARM validation pass.
+; Both SMs remain disabled except for the READ phase of one BUSARM validation pass.
+; Each SM re-checks /WR=HIGH before changing any data-pin direction.
 .wrap_target
 drive_loop:
     wait 1 irq 0 rel
-    jmp pin phi_alive
+    jmp pin read_not_write     ; JMP pin = GP1 /WR. LOW => never drive
     jmp drive_loop
-phi_alive:
+read_not_write:
     jmp !x low_three
 
 high_five:

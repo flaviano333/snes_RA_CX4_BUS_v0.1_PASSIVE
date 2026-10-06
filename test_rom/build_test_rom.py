@@ -43,7 +43,7 @@ a.emit(0x85,0x00,0x85,0x01,0x85,0x02,0x85,0x03)  # clear zp 00-03
 a.label('main')
 # Robust handshake: emit BUS7 at the beginning of EVERY pass.
 # The RP validator may start after the SNES, so a one-shot boot signature is not sufficient.
-for addr,val in [(0x7ff0,ord('B')),(0x7ff1,ord('U')),(0x7ff2,ord('S')),(0x7ff3,ord('7'))]:
+for addr,val in [(0x7ff0,ord('B')),(0x7ff1,ord('U')),(0x7ff2,ord('S')),(0x7ff3,ord('8'))]:
     a.emit(0xA9,val,0x8D,addr&0xff,addr>>8)
 a.emit(0xE6,0x02)         # INC sequence
 a.emit(0xA5,0x02,0x8D,0xF4,0x7F)  # seq -> $7FF4
@@ -65,6 +65,17 @@ a.emit(0xA9,0x20,0x8D,0xF5,0x7F)
 for addr,val in [(0x7f49,0x00),(0x7f4a,0x80),(0x7f4b,0x02),(0x7f4d,0x0e),(0x7f4e,0x00),(0x7f4f,0x5c)]:
     a.emit(0xA9,val,0x8D,addr&0xff,addr>>8)
 a.emit(0xA9,0x30,0x8D,0xF5,0x7F)  # phase READ
+# Give the RP mailbox scanner time to see phase READ and enable the two PIO
+# responders. 64 * 256 inner iterations is intentionally generous while still
+# keeping the validator fast. No target-window reads occur during this delay.
+a.emit(0xA0,0x40)          # LDY #$40
+a.label('arm_delay_y')
+a.emit(0xA2,0x00)          # LDX #0 => 256 iterations via wrap
+a.label('arm_delay_x')
+a.emit(0xE8)               # INX
+a.bra(0xD0,'arm_delay_x')
+a.emit(0x88)               # DEY
+a.bra(0xD0,'arm_delay_y')
 
 # error count zp00/01 = 0
 a.emit(0xA9,0x00,0x85,0x00,0x85,0x01)
@@ -123,7 +134,7 @@ bank[:len(a.b)] = a.b
 rom=bytearray([0xff])*ROM_SIZE
 # LoROM header at $7FC0 in bank 0.
 header=0x7fc0
-title=b'CX4 BUS VALIDATOR 107 '
+title=b'CX4 BUS VALIDATOR 108 '
 title=title[:21].ljust(21,b' ')
 bank[header:header+21]=title
 bank[header+0x15]=0x20  # LoROM slow
