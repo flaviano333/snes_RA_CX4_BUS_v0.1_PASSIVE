@@ -11,7 +11,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BUS v0.5 HLE-GAMEPLAY ISOLATED
+ * CX4 BOOTBACK HLE EXACT-OAM V2
  *
  * Goal: make the CPU-visible CX4 state deterministic for gameplay bring-up.
  * Runtime HG51B LLE is deliberately NOT connected to the CPU-visible C4RAM.
@@ -92,7 +92,7 @@ static volatile uint64_t s_hle_good_jobs = 0;
 static volatile uint64_t s_hle_rejected_jobs = 0;
 static volatile uint64_t s_hle_groups = 0;
 static volatile uint64_t s_hle_oam = 0;
-static volatile uint64_t s_hle_badparts = 0;
+static volatile uint64_t s_hle_longparts = 0;
 static volatile uint64_t s_hle_zero_ptr = 0;
 static volatile uint32_t s_hle_pmax = 0;
 static volatile uint32_t s_hle_last_ptr = 0;
@@ -261,7 +261,6 @@ static bool hle_conv_oam(void) {
     uint8_t bitoff = (uint8_t)((v626 & 3u) * 2u);
     uint16_t src = 0x0220u;
     uint32_t emitted = 0;
-    uint32_t bad_parts_this_job = 0;
 
     for (uint16_t gi = 0; gi < groups && spr_count; ++gi, src += 16u) {
         if (src + 15u >= sizeof(s_hle_input)) break;
@@ -278,14 +277,10 @@ static bool hle_conv_oam(void) {
         if (parts > s_hle_pmax) s_hle_pmax = parts;
         if (rp >= s_game_rom_size) s_hle_zero_ptr++;
 
-        /* A C4 OAM job can never emit more than the remaining SNES sprite slots.
-         * If the assembly claims more pieces than remain, treat that descriptor
-         * as corrupt for this frame rather than consuming arbitrary ROM bytes. */
-        if (parts > spr_count) {
-            s_hle_badparts++;
-            bad_parts_this_job++;
-            continue;
-        }
+        /* Exact Snes9x/C4 behavior: a descriptor may advertise more pieces
+         * than the remaining OAM slots. The loop below simply stops when
+         * SprCount reaches zero; this is NOT evidence of corrupt input. */
+        if (parts > spr_count) s_hle_longparts++;
 
         if (parts) {
             rp++;
@@ -331,14 +326,6 @@ static bool hle_conv_oam(void) {
             bitoff = (uint8_t)((bitoff + 2u) & 6u);
             if (!bitoff) oam2++;
         }
-    }
-
-    /* If more than half of all groups are implausible, keep the previous OAM.
-     * A good frame will replace it later; a bad capture cannot spray garbage. */
-    if (groups && bad_parts_this_job * 2u > groups) {
-        memcpy(s_c4ram, s_oam_backup, sizeof(s_oam_backup));
-        s_hle_rejected_jobs++;
-        return false;
     }
 
     s_hle_good_jobs++;
@@ -490,7 +477,7 @@ static void clear_runtime_state(void) {
     memset(s_hle_input, 0, sizeof(s_hle_input));
     memset(s_oam_backup, 0, sizeof(s_oam_backup));
     s_hle_jobs = s_hle_good_jobs = s_hle_rejected_jobs = 0;
-    s_hle_groups = s_hle_oam = s_hle_badparts = s_hle_zero_ptr = 0;
+    s_hle_groups = s_hle_oam = s_hle_longparts = s_hle_zero_ptr = 0;
     s_hle_pmax = 0; s_hle_last_ptr = 0; s_hle_last_sub = 0xffu;
     s_hle_math_jobs = s_hle_test_jobs = s_hle_unhandled = 0;
     s_inv625_bad = s_inv629_bad = s_inv627_bad = 0;
@@ -639,15 +626,15 @@ void cx4bus_selfcheck(void) {
 }
 
 void cx4bus_print_status(void) {
-    printf("CX4STAT mode=LAST_TRY_BOOTBACK_HLE armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
-           "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_pmax=%lu hle_badparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X "
+    printf("CX4STAT mode=BOOTBACK_HLE_EXACT_OAM_V2 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
+           "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X "
            "inv625_bad=%llu inv629_bad=%llu inv627_bad=%llu inv_last=%02X/%02X/%02X/%04X "
            "pio_w=%llu pio_ram=%llu pio_io=%llu cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_rom_slot_valid?1u:0u,
            (unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
            (unsigned long long)s_hle_jobs,(unsigned long long)s_hle_good_jobs,(unsigned long long)s_hle_rejected_jobs,
            (unsigned long long)s_hle_groups,(unsigned long long)s_hle_oam,(unsigned long long)s_hle_math_jobs,(unsigned long long)s_hle_test_jobs,(unsigned long long)s_hle_unhandled,(unsigned long)s_hle_pmax,
-           (unsigned long long)s_hle_badparts,(unsigned long long)s_hle_zero_ptr,(unsigned long)s_hle_last_ptr,s_hle_last_sub,
+           (unsigned long long)s_hle_longparts,(unsigned long long)s_hle_zero_ptr,(unsigned long)s_hle_last_ptr,s_hle_last_sub,
            (unsigned long long)s_inv625_bad,(unsigned long long)s_inv629_bad,(unsigned long long)s_inv627_bad,
            s_inv_last_625,s_inv_last_626,s_inv_last_629,s_inv_last_627,
            (unsigned long long)s_pio_writes,(unsigned long long)s_pio_ram_writes,(unsigned long long)s_pio_io_writes,
