@@ -6,7 +6,6 @@ void cx4bus_init(void);
 void cx4bus_launch_core1(void);
 void cx4bus_service(void);
 void cx4bus_pio_write(uint32_t address, uint8_t data);
-void cx4bus_pio_read(uint32_t address, uint8_t data);
 void cx4bus_arm(bool enabled);
 bool cx4bus_is_armed(void);
 void cx4bus_reset_state(void);
