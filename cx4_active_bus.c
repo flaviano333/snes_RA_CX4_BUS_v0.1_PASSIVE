@@ -9,7 +9,7 @@
 #include "bus_drive.pio.h"
 
 /*
- * v1.0.2 PIO-OE + EARLY PREARM ONE-PASS RESPONDER
+ * v1.0.3 EARLY-ADDRESS + PIO-OE ONE-PASS RESPONDER
  *
  * This deliberately does NOT emulate CX4. It validates the electrical/data
  * path with a deterministic test ROM. PIO+DMA is authoritative for writes.
@@ -184,25 +184,18 @@ void cx4bus_reset_state(void){ s_reset_requested=true; }
 
 static void __not_in_flash_func(core1_loop)(void){
     /*
-     * v1.0: synchronized one-pass validator with PIO-owned output-enable.
+     * v1.0.3: EARLY ADDRESS + PIO-owned OE.
      *
-     * BUSARM does not enable outputs immediately. The test-ROM mailbox starts
-     * the responder only at phase $30 (start of the NEXT complete read pass)
-     * and phase $40 disables it again. This removes the v0.9 mid-pass artifact.
+     * The v1.0.2 log proved that the final /RD re-check was too late:
+     * target-looking reads reached the final guard, but /RD had already risen,
+     * so gate_ctrl increased while active_target stayed at zero.
      *
-     * The read path is deliberately independent from captured writes: the
-     * validator ROM's byte pattern is deterministic, so the response comes
-     * from expected_data(address), not s_ram[]. This isolates RP->SNES timing
-     * from the known write-capture losses.
-     *
-     * Timing:
-     *   core1: PHI2 rises -> /RD low -> address/control decode -> queue byte.
-     *   PIO0 SM2: verify PHI2 still high -> assert D0-D7 OE -> wait for the
-     *   PHI2 falling edge -> remove OE deterministically.
-     *
-     * /ROMSEL and /WRAMSEL must both be inactive immediately before queueing.
-     * This prevents a stale address sample from ever driving during ROM opcode
-     * fetches or WRAM cycles.
+     * Capture A0-A23 near the beginning of PHI2-high (the v0.8 method), then
+     * wait for /RD inside that SAME PHI2 window.  As soon as /RD is seen low,
+     * sample /WR, /ROMSEL and /WRAMSEL once and queue the deterministic byte.
+     * There is deliberately NO second /RD check in C.  SM2 independently
+     * refuses to enable D0-D7 if PHI2 has already fallen and always removes OE
+     * on the PHI2 falling edge.
      */
     s_core1_started=true;
     data_release();
@@ -217,70 +210,63 @@ static void __not_in_flash_func(core1_loop)(void){
         prev_phi=true;
         s_phi_cycles++;
 
-        /* Give the A-bus a small fixed settle time after the PHI2 edge. */
-        __asm volatile("nop\n nop\n nop\n nop\n");
+        /* Sample the address early, while PHI2-high has just begun. */
+        __asm volatile("nop\n nop\n");
         if((sio_hw->gpio_in & PHI2_MASK)==0u){ prev_phi=false; continue; }
+        uint32_t lo_addr=sio_hw->gpio_in;
+        uint32_t hi_addr=sio_hw->gpio_hi_in;
+        uint32_t a=raw_address24(lo_addr,hi_addr);
+
+        bool armed = s_arm_request && s_magic;
+        bool bank_ok = ((a>>16)==0x00u);
+        uint16_t off=(uint16_t)a;
+        bool range_ok = (off>=0x6000u && off<=0x6bffu);
+        bool target = armed && bank_ok && range_ok;
+        if(target) s_phi_target++;
+
+        /* For non-target cycles, do not burn the whole PHI2 window waiting
+           for /RD.  We only need the active test-RAM reads. */
+        if(!target){
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
 
         bool saw_rd = ((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u);
         while(!saw_rd && ((sio_hw->gpio_in & PHI2_MASK) != 0u)){
             saw_rd = ((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u);
         }
-        if(!saw_rd){ prev_phi=false; continue; }
+        if(!saw_rd){
+            s_phi_no_rd++;
+            prev_phi=false;
+            continue;
+        }
         s_rd_edges++;
         s_phi_rd++;
+        s_phi_target_rd++;
 
-        /* A single post-settle sample avoids the v0.9 double-sample filter,
-           which rejected roughly half of all cycles by sampling across a bus
-           transition. */
-        __asm volatile("nop\n nop\n");
-        uint32_t lo=sio_hw->gpio_in;
-        uint32_t hi=sio_hw->gpio_hi_in;
-        uint32_t a=raw_address24(lo,hi);
-        bool wr_high = (lo & (1u << PIN_WR)) != 0u;
-
-        if(!s_arm_request || !s_magic || !wr_high){
-            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
-            prev_phi=false;
-            continue;
-        }
-        if((a>>16)!=0x00u){
-            s_rd_bank_miss++;
-            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
-            prev_phi=false;
-            continue;
-        }
-        uint16_t off=(uint16_t)a;
-        if(off<0x6000u || off>0x6bffu){
-            s_rd_range_miss++;
-            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
-            prev_phi=false;
-            continue;
-        }
-        /* Final current-cycle guard. Address was sampled once after /RD, but
-           these control signals are re-read immediately before the FIFO push.
-           A target CX4/test-RAM read has /RD=0, /WR=1, /ROMSEL=1 and
-           /WRAMSEL=1. ROM or WRAM cycles can therefore never be driven even if
-           an address sample is stale near a bus transition. */
-        uint32_t lo_now=sio_hw->gpio_in;
-        uint32_t hi_now=sio_hw->gpio_hi_in;
-        if((lo_now & PHI2_MASK)==0u){
+        /* One control sample at /RD assertion.  Do not re-check /RD after
+           software decode; that was the v1.0.2 failure mode. */
+        uint32_t lo_ctrl=sio_hw->gpio_in;
+        uint32_t hi_ctrl=sio_hw->gpio_hi_in;
+        if((lo_ctrl & PHI2_MASK)==0u){
             s_too_late++;
             prev_phi=false;
             continue;
         }
-        if((hi_now & RD_HI_MASK)!=0u || (lo_now & WR_MASK)==0u){
+        if((lo_ctrl & WR_MASK)==0u){
             s_gate_ctrl++;
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
-        if((hi_now & ROMSEL_HI_MASK)==0u){
+        if((hi_ctrl & ROMSEL_HI_MASK)==0u){
             s_gate_romsel++;
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
-        if((hi_now & WRAMSEL_HI_MASK)==0u){
+        if((hi_ctrl & WRAMSEL_HI_MASK)==0u){
             s_gate_wramsel++;
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
@@ -301,16 +287,12 @@ static void __not_in_flash_func(core1_loop)(void){
             prev_phi=false;
             continue;
         }
-        s_cpu_r++; s_rd_safe++; s_phi_target++; s_phi_target_rd++;
-        s_active_target++;
+        s_cpu_r++; s_rd_safe++; s_active_target++;
         s_last_off=off; s_last_data=v;
-        s_driven++;
-        s_drive_budget--;
+        s_driven++; s_drive_budget--;
 
-        /* Give PIO enough clocks to execute OUT + OE, then sample only while
-           the same PHI2 high phase is still alive. This is diagnostic only;
-           PIO owns release timing regardless of this check. */
-        __asm volatile("nop\n nop\n nop\n nop\n nop\n nop\n");
+        /* Diagnostic echo only; SM2 owns the actual release timing. */
+        __asm volatile("nop\n nop\n nop\n nop\n");
         if((sio_hw->gpio_in & PHI2_MASK)!=0u){
             uint8_t echo=raw_data(sio_hw->gpio_in);
             s_echo_target++;
@@ -321,7 +303,6 @@ static void __not_in_flash_func(core1_loop)(void){
         }
 
         while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
-        /* SM2 releases OE at the edge in hardware; this flag is informational. */
         s_driving=false;
         s_fixed_hold++;
         prev_phi=false;
@@ -458,10 +439,10 @@ void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=
 void cx4bus_print_runs(void){ printf("BUSREG seq=%u index=%lu bad=%lu expected=7F49:00 7F4A:80 7F4B:02 7F4D:0E 7F4E:00 7F4F:5C\n",s_seq,(unsigned long)s_reg_index,(unsigned long)s_reg_bad); }
 void cx4bus_selfcheck(void){ printf("BUSTEST ROM expected: test_rom/CX4_BUS_TEST.sfc (no injected game ROM required)\n"); }
 void cx4bus_print_status(void){
-    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.2_EARLY_PREARM arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
+    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.3_EARLY_ADDR_PIO_OE arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
            "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu bad_data_total=%llu bad_addr_total=%llu missing_total=%llu extra_total=%llu "
            "reg_passes=%llu reg_index=%lu reg_bad=%lu read_passes=%llu cur_err=%u last_err=%u read_good=%llu read_bad=%llu "
-           "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu "
+           "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu phi_target=%llu phi_rd=%llu phi_target_rd=%llu phi_no_rd=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu "
            "too_late=%llu cpu_r=%llu driven=%llu budget=%lu budget_cut=%llu auto_disarm=%llu edge_release=%llu "
            "active_passes=%llu active_last_err=%u active_target=%llu active_echo_bad=%llu "
            "pio_ready=%u pio_q=%llu pio_full=%llu pio_stale=%llu gate_rom=%llu gate_wram=%llu gate_ctrl=%llu "
@@ -476,7 +457,9 @@ void cx4bus_print_status(void){
            (unsigned long long)s_read_passes,(unsigned)s_read_errors,(unsigned)s_last_read_errors,
            (unsigned long long)s_read_pass_good,(unsigned long long)s_read_pass_bad,
            s_magic_mask,(unsigned long long)s_magic_hits,(unsigned long long)s_magic_bad,(unsigned long long)s_pio_w,
-           (unsigned long long)s_phi_cycles,(unsigned long long)s_rd_edges,(unsigned long long)s_rd_safe,
+           (unsigned long long)s_phi_cycles,(unsigned long long)s_phi_target,(unsigned long long)s_phi_rd,
+           (unsigned long long)s_phi_target_rd,(unsigned long long)s_phi_no_rd,
+           (unsigned long long)s_rd_edges,(unsigned long long)s_rd_safe,
            (unsigned long long)s_rd_bank_miss,(unsigned long long)s_rd_range_miss,
            (unsigned long long)s_too_late,
            (unsigned long long)s_cpu_r,(unsigned long long)s_driven,(unsigned long)s_drive_budget,
