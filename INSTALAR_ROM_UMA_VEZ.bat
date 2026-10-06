@@ -1,7 +1,32 @@
-@echo off
-setlocal
-if "%~2"=="" (
-  echo Uso: INSTALAR_ROM_UMA_VEZ.bat "CX4_V4_PASSIVE_SYSCLK_RESET_V6_1_GENERIC.uf2" "C:\ROMs\Mega Man X2.sfc"
-  exit /b 1
+cmake_minimum_required(VERSION 3.13)
+set(PICO_BOARD spotpear_rp2350b_mini_a CACHE STRING "RP2350B board")
+set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards CACHE STRING "Custom board headers")
+include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+project(cx4_sysclk_only_hybrid_v6_2 C CXX ASM)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+pico_sdk_init()
+
+if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.c" OR
+   NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.h")
+  message(FATAL_ERROR "CX4 core missing. Build with the included GitHub Actions workflow.")
+endif()
+
+add_executable(cx4_sysclk_only_hybrid_v6_2
+    main.c
+    cx4_active_bus.c
+    third_party/cx4.c
 )
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0INSTALAR_ROM_UMA_VEZ.ps1" -Uf2Generico "%~1" -RomPath "%~2"
+target_include_directories(cx4_sysclk_only_hybrid_v6_2 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
+pico_generate_pio_header(cx4_sysclk_only_hybrid_v6_2 ${CMAKE_CURRENT_LIST_DIR}/capture_low.pio)
+pico_generate_pio_header(cx4_sysclk_only_hybrid_v6_2 ${CMAKE_CURRENT_LIST_DIR}/capture_high.pio)
+pico_generate_pio_header(cx4_sysclk_only_hybrid_v6_2 ${CMAKE_CURRENT_LIST_DIR}/master_clock.pio)
+target_link_libraries(cx4_sysclk_only_hybrid_v6_2 pico_stdlib pico_multicore hardware_pio hardware_dma hardware_gpio hardware_clocks m)
+pico_enable_stdio_usb(cx4_sysclk_only_hybrid_v6_2 1)
+pico_enable_stdio_uart(cx4_sysclk_only_hybrid_v6_2 0)
+target_compile_definitions(cx4_sysclk_only_hybrid_v6_2 PRIVATE PICO_PIO_USE_GPIO_BASE=1)
+target_compile_options(cx4_sysclk_only_hybrid_v6_2 PRIVATE -O3)
+pico_add_extra_outputs(cx4_sysclk_only_hybrid_v6_2)
