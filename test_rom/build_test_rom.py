@@ -41,22 +41,21 @@ a.emit(0xA9,0x7C,0x8D,0x22,0x21)  # BGR555 high
 a.emit(0xA9,0x0F,0x8D,0x00,0x21)  # display on, max brightness
 a.emit(0x85,0x00,0x85,0x01,0x85,0x02,0x85,0x03)  # clear zp 00-03
 a.label('main')
-# Robust handshake: emit BUS6 at the beginning of EVERY pass.
+# Robust handshake: emit BUS7 at the beginning of EVERY pass.
 # The RP validator may start after the SNES, so a one-shot boot signature is not sufficient.
-for addr,val in [(0x7ff0,ord('B')),(0x7ff1,ord('U')),(0x7ff2,ord('S')),(0x7ff3,ord('6'))]:
+for addr,val in [(0x7ff0,ord('B')),(0x7ff1,ord('U')),(0x7ff2,ord('S')),(0x7ff3,ord('7'))]:
     a.emit(0xA9,val,0x8D,addr&0xff,addr>>8)
 a.emit(0xE6,0x02)         # INC sequence
 a.emit(0xA5,0x02,0x8D,0xF4,0x7F)  # seq -> $7FF4
 a.emit(0xA9,0x10,0x8D,0xF5,0x7F)  # phase WRITE
 
-# Write 12 pages $6000-$6BFF. value = low ^ page ^ $5A.
+# Write 12 pages $6000-$6BFF. value = low address byte (A0..A7).
 for page in range(12):
     base=0x6000+page*0x100
     lab=f'w{page}'
     a.emit(0xA2,0x00)      # LDX #0
     a.label(lab)
     a.emit(0x8A)           # TXA
-    a.emit(0x49,(page ^ 0x5A)&0xff) # EOR #imm
     a.emit(0x9D,base&0xff,base>>8)  # STA abs,X
     a.emit(0xE8)           # INX
     a.bra(0xD0,lab)        # BNE
@@ -77,7 +76,6 @@ for page in range(12):
     a.emit(0xBD,base&0xff,base>>8)  # LDA abs,X
     a.emit(0x85,0x03)              # STA zp03
     a.emit(0x8A)                   # TXA
-    a.emit(0x49,(page ^ 0x5A)&0xff)
     a.emit(0xC5,0x03)              # CMP zp03
     a.bra(0xF0,ok)                 # BEQ ok
     a.emit(0xE6,0x00)              # INC err lo
@@ -125,7 +123,7 @@ bank[:len(a.b)] = a.b
 rom=bytearray([0xff])*ROM_SIZE
 # LoROM header at $7FC0 in bank 0.
 header=0x7fc0
-title=b'CX4 BUS VALIDATOR 081 '
+title=b'CX4 BUS VALIDATOR 107 '
 title=title[:21].ljust(21,b' ')
 bank[header:header+21]=title
 bank[header+0x15]=0x20  # LoROM slow

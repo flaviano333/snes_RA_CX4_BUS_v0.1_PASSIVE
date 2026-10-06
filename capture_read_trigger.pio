@@ -2,29 +2,39 @@
 .program snes_read_trigger
 ; RP2350B PIO2, GPIO base = 16
 ;
-; Physical GP35 = CPU /RD
-; Physical GP38 = /ROMSEL
+; SM0: physical /RD detector + /ROMSEL first-stage gate.
+;   GP35 /RD     -> WAIT GPIO index 19 (35-16)
+;   GP38 /ROMSEL -> JMP PIN configured by C
 ;
-; WAIT GPIO indices are RELATIVE to the PIO GPIO base:
-;   GP35 -> 19
-; JMP PIN is configured from C to physical GP38.
-;
-; v1.0.6 ROMSEL HARDWARE GATE:
-;   IRQ2 (active D0-D7 responder) is published only when /ROMSEL is HIGH
-;   at the physical /RD falling edge. A genuine cartridge-ROM read has
-;   /ROMSEL LOW, so it can never receive the active-drive IRQ.
-;
-; IRQ1 remains unconditional so passive read capture still sees every read.
-; PIO2 NEXT wraps to PIO0 on RP2350.
-
+; A LOW /ROMSEL is a genuine cartridge-ROM access. Such a cycle is never
+; forwarded to the active responder. A HIGH /ROMSEL read raises local PIO2
+; IRQ4 for SM1 to apply the /WRAMSEL gate.
 .wrap_target
-    wait 0 gpio 19         ; physical GP35 /RD asserted (active low)
-    jmp pin drive_allowed  ; jmp pin = physical GP38 /ROMSEL; HIGH only
-    jmp passive_only       ; /ROMSEL LOW => absolutely no active-drive IRQ
- drive_allowed:
-    irq next 2             ; PIO0 IRQ2 -> preloaded D0-D7 responder
- passive_only:
-    irq next 1             ; PIO0 IRQ1 -> passive read capture
-    wait 1 gpio 19         ; physical GP35 /RD released
-    nop
+rd_loop:
+    wait 0 gpio 19
+    jmp pin romsel_open
+    jmp rd_release
+romsel_open:
+    irq 4
+rd_release:
+    wait 1 gpio 19
+    jmp rd_loop
+.wrap
+
+.program snes_drive_qualifier
+; PIO2 SM1: second-stage /WRAMSEL gate.
+; JMP PIN is physical GP39 /WRAMSEL, active LOW.
+;
+; Only reads with BOTH /ROMSEL HIGH and /WRAMSEL HIGH reach PIO0.
+; IRQ2 and IRQ3 are separate so two PIO0 data state machines can consume the
+; same qualified /RD event without racing over one IRQ flag.
+.wrap_target
+qual_loop:
+    wait 1 irq 4
+    jmp pin qualified
+    jmp qual_loop
+qualified:
+    irq next 2
+    irq next 3
+    jmp qual_loop
 .wrap

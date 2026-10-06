@@ -1,35 +1,42 @@
 .pio_version 1
-.program snes_bus_drive
-; PIO0 SM2, GPIO base = 0.
-; GP2..GP10 are one contiguous 9-pin window:
-;   bits 0..2 = D0..D2
-;   bit 3     = unused GP5
-;   bits 4..8 = D3..D7
+.program snes_bus_drive_split
+; PIO0 shared program for SM2 and SM3. GPIO base = 0.
 ;
-; TX word layout (shift-right):
-;   bits 0..8   = output levels for GP2..GP10
-;   bits 9..17  = output-enable mask (normally 0x1FF)
+; The final validator does not ask Core1 to calculate a byte during /RD.
+; Instead the test ROM expects DATA = A0..A7. The two state machines sample
+; those address bits directly in PIO and copy them onto the split D bus:
 ;
-; v1.0.6 PRELOAD + RD + ROMSEL-HARDWARE-GATE:
-; Core1 queues the already-computed data word BEFORE /RD. PIO2 raises
-; PIO0 IRQ2 at the physical /RD falling edge ONLY when /ROMSEL is HIGH,
-; so genuine ROM reads can never open the D0-D7 output gate. PHI2 remains
-; lifetime gate: if the event arrives after PHI2 fell, OE never turns on;
-; once enabled, OE is removed deterministically after PHI2 falls.
-
+;   SM2: X=0, IN base GP11 (A0), OUT/SET base GP2  -> D0..D2 (3 bits)
+;   SM3: X=1, IN base GP14 (A3), OUT/SET base GP6  -> D3..D7 (5 bits)
+;
+; WAIT IRQ 0 REL maps to IRQ2 on SM2 and IRQ3 on SM3. PIO2 only publishes
+; those IRQs when /RD is LOW, /ROMSEL is HIGH and /WRAMSEL is HIGH.
+; Both SMs remain disabled except for the single BUSARM validation pass.
 .wrap_target
-loop:
-    pull block
-    wait 1 irq 2           ; /RD event from PIO2; clears PIO0 IRQ2
-    jmp pin phi_ok_1       ; jmp pin = PHI2
-    jmp loop               ; stale/late event: discard word, keep OE off
-phi_ok_1:
-    out pins, 9            ; put data levels on pads while still inputs
-    jmp pin phi_ok_2
-    jmp loop               ; PHI2 vanished before OE: discard safely
-phi_ok_2:
-    out pindirs, 9         ; assert OE only after data is already present
-    wait 0 gpio 0          ; hold through the rest of PHI2 high
-    mov osr, null
-    out pindirs, 9         ; release GP2..GP10
+drive_loop:
+    wait 1 irq 0 rel
+    jmp pin phi_alive
+    jmp drive_loop
+phi_alive:
+    jmp !x low_three
+
+high_five:
+    mov isr, null
+    in pins, 5
+    mov osr, isr
+    out pins, 5
+    set pindirs, 31
+    jmp hold_until_phi_fall
+
+low_three:
+    mov isr, null
+    in pins, 3
+    mov osr, isr
+    out pins, 3
+    set pindirs, 31
+
+hold_until_phi_fall:
+    wait 0 gpio 0
+    set pindirs, 0
+    jmp drive_loop
 .wrap

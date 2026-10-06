@@ -14,8 +14,6 @@
 #include "capture_low.pio.h"
 #include "capture_high.pio.h"
 #include "capture_read_trigger.pio.h"
-#include "capture_read_low.pio.h"
-#include "capture_read_high.pio.h"
 #include "cx4_active_bus.h"
 
 #define PIN_PHI2       0
@@ -735,7 +733,7 @@ static void print_help(void) {
     printf("  BUSTRACE                show last bus-test access/phase\n");
     printf("  BUSREG                  show register-sequence validation\n");
     printf("  BUSTEST                 show expected test ROM name\n");
-    printf("  BUSARM                  enable readback ONLY for BUS6 test ROM $00:6000-$6BFF\n");
+    printf("  BUSARM                  enable readback ONLY for BUS7 test ROM $00:6000-$6BFF\n");
     printf("  BUSDISARM               disable active response; D0-D7 immediately INPUT\n");
     printf("  BUSRESET                clear validator state without changing arm request\n");
     printf("  PING                    reply PONG\n");
@@ -1248,14 +1246,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + BUS VALIDATOR v1.0.6 ROMSEL-HW-GATE ===\n");
+    printf("\n=== SNES RP2350B BUS VALIDATOR v1.0.7 SPLIT-PIO-DIRECT ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
     printf("A11..A13=GP23..25; GP26=SKIP; A14..A21=GP27..34; /RD=GP35.\n");
     printf("A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39.\n");
     printf("GP39=/WRAMSEL is ACTIVE in v2.0; GP40 remains A10.\n");
-    printf("Type HELP for commands. BUS readback starts DISARMED and is gated by the BUS6 test ROM magic.\n\n");
+    printf("Type HELP for commands. BUS readback starts DISARMED and is gated by the bundled BUS7 test ROM magic.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 40; ++pin) {
@@ -1300,42 +1298,33 @@ int main(void) {
     sm_config_set_fifo_join(&c_hi, PIO_FIFO_JOIN_RX);
     int init_hi_rc = pio_sm_init(pio_hi, sm_hi, off_hi, &c_hi);
 
-    // ---------- PIO2: /RD detector + /ROMSEL hardware gate ----------
+    // ---------- PIO2: /RD -> /ROMSEL -> /WRAMSEL hardware qualifier ----------
     PIO pio_rd = pio2;
     const uint sm_rd_trigger = 0;
+    const uint sm_drive_qualifier = 1;
     int base_rd_rc = pio_set_gpio_base(pio_rd, 16);
+
     pio_gpio_init(pio_rd, PIN_RD);
+    pio_gpio_init(pio_rd, PIN_ROMSEL);
+    pio_gpio_init(pio_rd, PIN_WRAMSEL);
     pio_sm_set_consecutive_pindirs(pio_rd, sm_rd_trigger, PIN_RD, 1, false);
+    pio_sm_set_consecutive_pindirs(pio_rd, sm_drive_qualifier, PIN_WRAMSEL, 1, false);
+
     uint off_rd_trigger = pio_add_program(pio_rd, &snes_read_trigger_program);
     pio_sm_config c_rd_trigger = snes_read_trigger_program_get_default_config(off_rd_trigger);
-    // RP2350B + PICO_PIO_USE_GPIO_BASE=1: sm_config pin APIs take real GPIO numbers.
-    // PIO2 base is 16, so physical GP38 is valid here and becomes JMP PIN index 22.
     sm_config_set_jmp_pin(&c_rd_trigger, PIN_ROMSEL);
     int init_rd_trigger_rc = pio_sm_init(pio_rd, sm_rd_trigger, off_rd_trigger, &c_rd_trigger);
 
-    // ---------- PIO0 SM1: GP2..GP19 low window on reads ----------
-    const uint sm_read_lo = 1;
-    uint off_read_lo = pio_add_program(pio_lo, &snes_capture_read_low_program);
-    pio_sm_config c_read_lo = snes_capture_read_low_program_get_default_config(off_read_lo);
-    sm_config_set_in_pins(&c_read_lo, PIN_DATA_BASE);
-    sm_config_set_in_shift(&c_read_lo, true, false, 32);
-    sm_config_set_fifo_join(&c_read_lo, PIO_FIFO_JOIN_RX);
-    int init_read_lo_rc = pio_sm_init(pio_lo, sm_read_lo, off_read_lo, &c_read_lo);
+    uint off_drive_qualifier = pio_add_program(pio_rd, &snes_drive_qualifier_program);
+    pio_sm_config c_drive_qualifier = snes_drive_qualifier_program_get_default_config(off_drive_qualifier);
+    sm_config_set_jmp_pin(&c_drive_qualifier, PIN_WRAMSEL);
+    int init_drive_qualifier_rc = pio_sm_init(pio_rd, sm_drive_qualifier, off_drive_qualifier, &c_drive_qualifier);
 
-    // ---------- PIO1 SM1: GP21..GP40 high window on reads ----------
-    const uint sm_read_hi = 1;
-    uint off_read_hi = pio_add_program(pio_hi, &snes_capture_read_high_program);
-    pio_sm_config c_read_hi = snes_capture_read_high_program_get_default_config(off_read_hi);
-    sm_config_set_in_pins(&c_read_hi, PIN_HIGH_BASE);
-    sm_config_set_in_shift(&c_read_hi, true, false, 32);
-    sm_config_set_fifo_join(&c_read_hi, PIO_FIFO_JOIN_RX);
-    int init_read_hi_rc = pio_sm_init(pio_hi, sm_read_hi, off_read_hi, &c_read_hi);
-
-    printf("PIO init: base_lo=%d init_lo=%d | base_hi=%d init_hi=%d | base_rd=%d trig=%d read_lo=%d read_hi=%d\n",
+    printf("PIO init: base_lo=%d init_lo=%d | base_hi=%d init_hi=%d | base_rd=%d trig=%d qual=%d\n",
            base_lo_rc, init_lo_rc, base_hi_rc, init_hi_rc,
-           base_rd_rc, init_rd_trigger_rc, init_read_lo_rc, init_read_hi_rc);
+           base_rd_rc, init_rd_trigger_rc, init_drive_qualifier_rc);
     if (base_lo_rc || init_lo_rc || base_hi_rc || init_hi_rc ||
-        base_rd_rc || init_rd_trigger_rc || init_read_lo_rc || init_read_hi_rc) {
+        base_rd_rc || init_rd_trigger_rc || init_drive_qualifier_rc) {
         printf("ERROR: PIO configuration failed. Leave the SNES off.\n");
         fflush(stdout);
         while (true) {
@@ -1363,33 +1352,21 @@ int main(void) {
     channel_config_set_write_increment(&dc_hi, true);
     channel_config_set_dreq(&dc_hi, pio_get_dreq(pio_hi, sm_hi, false));
 
-    int dma_read_lo = dma_claim_unused_channel(true);
-    int dma_read_hi = dma_claim_unused_channel(true);
-
-    // Expose channel numbers to CX4STAT's non-destructive live scanner.
+    // Expose the authoritative WRITE DMA pair to the incremental mailbox scanner.
     cx4_dma_write_lo = dma_lo;
     cx4_dma_write_hi = dma_hi;
-    cx4_dma_read_lo = dma_read_lo;
-    cx4_dma_read_hi = dma_read_hi;
     cx4_active_write_buf = 0;
-    cx4_active_read_buf = 0;
     cx4_pio_write_scan_pos[0] = cx4_pio_write_scan_pos[1] = 0;
     cx4_pio_write_scan_total = 0;
 
-    dma_channel_config dc_read_lo = dma_channel_get_default_config(dma_read_lo);
-    channel_config_set_transfer_data_size(&dc_read_lo, DMA_SIZE_32);
-    channel_config_set_read_increment(&dc_read_lo, false);
-    channel_config_set_write_increment(&dc_read_lo, true);
-    channel_config_set_dreq(&dc_read_lo, pio_get_dreq(pio_lo, sm_read_lo, false));
+    // v1.0.7 intentionally does not allocate the passive READ DMA pipeline.
+    // PIO0 SM2+SM3 are reserved for the split direct responder during BUSARM.
+    cx4_dma_read_lo = -1;
+    cx4_dma_read_hi = -1;
+    cx4_active_read_buf = 0;
 
-    dma_channel_config dc_read_hi = dma_channel_get_default_config(dma_read_hi);
-    channel_config_set_transfer_data_size(&dc_read_hi, DMA_SIZE_32);
-    channel_config_set_read_increment(&dc_read_hi, false);
-    channel_config_set_write_increment(&dc_read_hi, true);
-    channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
-
-    printf("READY. RA v2.0 READ-REPAIR preserved; BUS VALIDATOR v1.0.6 ROMSEL-HW-GATE available; drive starts OFF.\n");
-    printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
+    printf("READY. BUS VALIDATOR v1.0.7 SPLIT-PIO-DIRECT available; drive starts OFF.\n");
+    printf("Use BUSRESET, BUSSTAT, BUSARM, BUSOFF, BUSTRACE or BUSTEST for this final validator.\n\n");
     fflush(stdout);
 
     // Start both capture pipelines. Each pipeline is independently rearmed when its
@@ -1409,30 +1386,22 @@ int main(void) {
     pio_sm_set_enabled(pio_hi, sm_hi, true);
     pio_sm_set_enabled(pio_lo, sm_lo, true);
 
-    // Read pipeline initial arm.
+    // Start the two-stage hardware read qualifier. It may publish IRQ2/IRQ3,
+    // but PIO0 responder SM2/SM3 remain disabled until BUSARM activates one pass.
     pio_sm_set_enabled(pio_rd, sm_rd_trigger, false);
-    pio_sm_set_enabled(pio_lo, sm_read_lo, false);
-    pio_sm_set_enabled(pio_hi, sm_read_hi, false);
+    pio_sm_set_enabled(pio_rd, sm_drive_qualifier, false);
     pio_sm_restart(pio_rd, sm_rd_trigger);
-    pio_sm_restart(pio_lo, sm_read_lo);
-    pio_sm_restart(pio_hi, sm_read_hi);
-    pio_sm_clear_fifos(pio_lo, sm_read_lo);
-    pio_sm_clear_fifos(pio_hi, sm_read_hi);
-    pio_interrupt_clear(pio_lo, 1);
-    pio_interrupt_clear(pio_hi, 1);
-    arm_dma_channel(dma_read_lo, &dc_read_lo, read_low_samples[0], &pio_lo->rxf[sm_read_lo]);
-    arm_dma_channel(dma_read_hi, &dc_read_hi, read_high_samples[0], &pio_hi->rxf[sm_read_hi]);
-    dma_start_channel_mask((1u << dma_read_lo) | (1u << dma_read_hi));
-    pio_sm_set_enabled(pio_hi, sm_read_hi, true);
-    pio_sm_set_enabled(pio_lo, sm_read_lo, true);
+    pio_sm_restart(pio_rd, sm_drive_qualifier);
+    pio_interrupt_clear(pio_rd, 4);
+    pio_interrupt_clear(pio0, 2);
+    pio_interrupt_clear(pio0, 3);
+    pio_sm_set_enabled(pio_rd, sm_drive_qualifier, true);
     pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
 
-    // Dedicated core1 handles the latency-critical active CX4 cartridge interface.
-    // It starts with response disabled; CX4ARM is required before any data pin drives.
+    // v1.0.7 has no latency-critical CPU responder; the compatibility call is a no-op.
     cx4bus_launch_core1();
 
     uint write_buf = 0;
-    uint read_buf = 0;
 
     while (true) {
         // v0.4: PIO+DMA is authoritative for CX4 writes. Feed every newly
@@ -1464,23 +1433,6 @@ int main(void) {
             // Service CX4 before/after the comparatively heavy RA mirror decode.
             cx4bus_service();
             process_write_batch(low_samples[done], high_samples[done]);
-            cx4bus_service();
-        }
-
-        if (dma_remaining(dma_read_lo) == 0 && dma_remaining(dma_read_hi) == 0) {
-            uint done = read_buf;
-            uint next = done ^ 1u;
-
-            dma_channel_set_write_addr(dma_read_lo, read_low_samples[next], false);
-            dma_channel_set_trans_count(dma_read_lo, SAMPLE_COUNT, false);
-            dma_channel_set_write_addr(dma_read_hi, read_high_samples[next], false);
-            dma_channel_set_trans_count(dma_read_hi, SAMPLE_COUNT, false);
-            dma_start_channel_mask((1u << dma_read_lo) | (1u << dma_read_hi));
-            read_buf = next;
-            cx4_active_read_buf = next;
-
-            cx4bus_service();
-            process_read_batch(read_low_samples[done], read_high_samples[done]);
             cx4bus_service();
         }
 
