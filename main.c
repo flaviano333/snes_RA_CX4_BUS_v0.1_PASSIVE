@@ -176,7 +176,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 BOOTBACK HLE BUSY-SYNC V3 ===\n");
+    printf("\n=== SNES RP2350B CX4 BOOTBACK HLE BUSY-SYNC V4 ===\n");
     printf("clock=%u kHz | lean build + v0.5 boot-path HLE\n", GAMEPLAY_CLOCK_KHZ);
     printf("pinout unchanged: PHI2=GP0 /WR=GP1 D0-2=GP2-4 GP5=SKIP D3-7=GP6-10 /RD=GP35 /ROMSEL=GP38 /WRAMSEL=GP39 A10=GP40\n");
     printf("write authority: PIO+DMA, qualified by /ROMSEL HIGH + /WRAMSEL HIGH\n");
@@ -254,7 +254,7 @@ int main(void) {
     pio_sm_set_enabled(pio_lo,sm_lo,true);
 
     cx4bus_launch_core1();
-    printf("READY BUSY-SYNC V3. Power/reset the SNES with Mega Man X2 selected.\n");
+    printf("READY BUSY-SYNC V4. Power/reset the SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {

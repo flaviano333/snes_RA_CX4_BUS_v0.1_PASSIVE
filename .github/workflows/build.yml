@@ -1,4 +1,4 @@
-name: Build CX4 BOOTBACK HLE BUSY SYNC V3
+name: Build CX4 BOOTBACK HLE BUSY SYNC V4
 
 on:
   workflow_dispatch:
@@ -36,9 +36,9 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Rename UF2
-        run: cp build/cx4_bootback_busy_sync_v3.uf2 build/CX4_BOOTBACK_HLE_BUSY_SYNC_V3_GENERIC_SEM_ROM.uf2
+        run: cp build/cx4_bootback_busy_sync_v4.uf2 build/CX4_BOOTBACK_HLE_BUSY_SYNC_V4_GENERIC_SEM_ROM.uf2
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: CX4-BOOTBACK-HLE-BUSY-SYNC-V3
-          path: build/CX4_BOOTBACK_HLE_BUSY_SYNC_V3_GENERIC_SEM_ROM.uf2
+          name: CX4-BOOTBACK-HLE-BUSY-SYNC-V4
+          path: build/CX4_BOOTBACK_HLE_BUSY_SYNC_V4_GENERIC_SEM_ROM.uf2

@@ -11,7 +11,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BOOTBACK HLE BUSY-SYNC V3
+ * CX4 BOOTBACK HLE BUSY-SYNC V4
  *
  * Goal: make the CPU-visible CX4 state deterministic for gameplay bring-up.
  * Runtime HG51B LLE is deliberately NOT connected to the CPU-visible C4RAM.
@@ -488,6 +488,55 @@ static void hle_on_command(uint16_t off, uint8_t data) {
         return;
     }
 
+    /* C4 immediate/self-test command family. These are command-level results
+     * used by X2/X3 and match the established C4 HLE behavior. */
+    if (s_hle_last_sub == 0x0eu) {
+        if (data == 0x40u) { /* Sum first 0x800 C4 RAM bytes. */
+            uint16_t sum = 0;
+            for (uint32_t i = 0; i < 0x800u; ++i) sum = (uint16_t)(sum + s_c4ram[i]);
+            wr16(&s_c4ram[0x1f80u], sum);
+            s_hle_test_jobs++;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            hle_busy_clear();
+            return;
+        }
+        if (data == 0x54u) { /* Signed 24-bit square -> 48-bit result. */
+            int32_t a = (int32_t)rd24u(&s_c4ram[0x1f80u]);
+            if (a & 0x00800000) a |= (int32_t)0xff000000;
+            uint64_t sq = (uint64_t)((int64_t)a * (int64_t)a);
+            wr24(&s_c4ram[0x1f83u], (uint32_t)(sq & 0x00ffffffu));
+            wr24(&s_c4ram[0x1f86u], (uint32_t)((sq >> 24) & 0x00ffffffu));
+            s_hle_test_jobs++;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            hle_busy_clear();
+            return;
+        }
+        if (data == 0x5cu) { /* Immediate register test pattern. */
+            static const uint8_t pat[48] = {
+                0x00,0x00,0x00,0xff, 0xff,0xff,0x00,0xff,
+                0x00,0x00,0x00,0xff, 0xff,0xff,0x00,0x00,
+                0xff,0xff,0x00,0x00, 0x80,0xff,0xff,0x7f,
+                0x00,0x80,0x00,0xff, 0x7f,0x00,0xff,0x7f,
+                0xff,0x7f,0xff,0xff, 0x00,0x00,0x01,0xff,
+                0xff,0xfe,0x00,0x01, 0x00,0xff,0xfe,0x00
+            };
+            memcpy(&s_c4ram[0], pat, sizeof(pat));
+            s_hle_test_jobs++;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            hle_busy_clear();
+            return;
+        }
+        if (data == 0x89u) { /* Immediate ROM signature. */
+            s_c4ram[0x1f80u] = 0x36u;
+            s_c4ram[0x1f81u] = 0x43u;
+            s_c4ram[0x1f82u] = 0x05u;
+            s_hle_test_jobs++;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            hle_busy_clear();
+            return;
+        }
+    }
+
     if (data == 0x00u && s_hle_last_sub == 0x00u) {
         (void)hle_conv_oam();
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -673,7 +722,7 @@ void cx4bus_selfcheck(void) {
 }
 
 void cx4bus_print_status(void) {
-    printf("CX4STAT mode=BOOTBACK_HLE_BUSY_SYNC_V3 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
+    printf("CX4STAT mode=BOOTBACK_HLE_BUSY_SYNC_V4 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
            "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X busy=%u busy_arm=%llu busy_clear=%llu busy_reads=%llu busy_rearm=%llu unh_last=%02X/%02X "
            "inv625_bad=%llu inv629_bad=%llu inv627_bad=%llu inv_last=%02X/%02X/%02X/%04X "
            "pio_w=%llu pio_ram=%llu pio_io=%llu cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
