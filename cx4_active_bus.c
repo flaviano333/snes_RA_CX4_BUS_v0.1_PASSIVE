@@ -4,10 +4,12 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
+#include "hardware/pio.h"
 #include "hardware/structs/sio.h"
+#include "bus_drive.pio.h"
 
 /*
- * v0.9.1 SYNCED ONE-PASS + DETERMINISTIC READ RESPONDER
+ * v1.0 PIO-OE + SYNCHRONIZED ONE-PASS RESPONDER
  *
  * This deliberately does NOT emulate CX4. It validates the electrical/data
  * path with a deterministic test ROM. PIO+DMA is authoritative for writes.
@@ -17,9 +19,14 @@
 #define PIN_PHI2 0u
 #define PIN_WR   1u
 #define PIN_RD   35u
+#define PIN_ROMSEL 38u
+#define PIN_WRAMSEL 39u
 #define DATA_MASK ((1u << 2) | (1u << 3) | (1u << 4) | (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 10))
 #define PHI2_MASK (1u << PIN_PHI2)
+#define WR_MASK   (1u << PIN_WR)
 #define RD_HI_MASK (1u << (PIN_RD - 32u))
+#define ROMSEL_HI_MASK (1u << (PIN_ROMSEL - 32u))
+#define WRAMSEL_HI_MASK (1u << (PIN_WRAMSEL - 32u))
 
 static uint8_t s_ram[0x0c00];
 static volatile bool s_arm_request=false, s_arm_pending=false, s_driving=false, s_core1_started=false;
@@ -45,7 +52,12 @@ static volatile uint64_t s_echo_target=0, s_echo_match=0, s_echo_bad=0;
 static volatile uint64_t s_auto_disarm=0, s_budget_cut=0;
 static volatile uint64_t s_active_passes=0, s_active_target=0, s_active_echo_bad=0;
 static volatile uint16_t s_active_last_err=0xffffu;
+static volatile uint64_t s_pio_queued=0, s_pio_fifo_full=0, s_pio_stale=0;
+static volatile uint64_t s_gate_romsel=0, s_gate_wramsel=0, s_gate_ctrl=0;
 static volatile uint32_t s_drive_budget=0;
+static PIO s_drive_pio = pio0;
+static const uint s_drive_sm = 2u;
+static bool s_drive_ready = false;
 static volatile bool s_arm_wait_pass=false;
 static volatile uint16_t s_sample_last_off=0; static volatile uint8_t s_sample_last_got=0, s_sample_last_exp=0;
 static volatile uint16_t s_expected_off=0x6000u;
@@ -59,9 +71,29 @@ static inline uint8_t expected_data(uint16_t off){
     return (uint8_t)((rel & 0xffu) ^ ((rel>>8)&0xffu) ^ 0x5au);
 }
 static inline uint8_t raw_data(uint32_t lo){ return (uint8_t)(((lo>>2)&7u)|((lo>>3)&0xf8u)); }
-static inline uint32_t packed_data(uint8_t v){ return (((uint32_t)v&7u)<<2)|(((uint32_t)v&0xf8u)<<3); }
-static inline void data_release(void){ gpio_set_dir_in_masked(DATA_MASK); s_driving=false; }
-static inline void data_drive(uint8_t v){ gpio_put_masked(DATA_MASK,packed_data(v)); gpio_set_dir_out_masked(DATA_MASK); s_driving=true; }
+/* PIO0 drives GP2..GP10 as a 9-pin window; GP5 is an unconnected dummy bit. */
+static inline uint32_t packed9_data(uint8_t v){ return ((uint32_t)v & 7u) | (((uint32_t)v & 0xf8u) << 1); }
+static inline uint32_t drive_word(uint8_t v){ return packed9_data(v) | (0x1ffu << 9); }
+static void data_release(void){
+    if(s_drive_ready){
+        pio_sm_set_enabled(s_drive_pio, s_drive_sm, false);
+        pio_sm_clear_fifos(s_drive_pio, s_drive_sm);
+        pio_sm_restart(s_drive_pio, s_drive_sm);
+        pio_sm_set_consecutive_pindirs(s_drive_pio, s_drive_sm, 2, 9, false);
+        pio_sm_set_enabled(s_drive_pio, s_drive_sm, true);
+    }
+    s_driving=false;
+}
+static inline bool queue_drive(uint8_t v){
+    if(!s_drive_ready || pio_sm_is_tx_fifo_full(s_drive_pio, s_drive_sm)){
+        s_pio_fifo_full++;
+        return false;
+    }
+    pio_sm_put(s_drive_pio, s_drive_sm, drive_word(v));
+    s_pio_queued++;
+    s_driving=true;
+    return true;
+}
 
 static inline uint32_t raw_address24(uint32_t lo,uint32_t hi){
     uint32_t a=0;
@@ -94,6 +126,8 @@ static void clear_state(void){
     s_addr_double=s_addr_unstable=s_too_late=0;
     s_echo_target=s_echo_match=s_echo_bad=0; s_auto_disarm=s_budget_cut=0;
     s_active_passes=s_active_target=s_active_echo_bad=0; s_active_last_err=0xffffu;
+    s_pio_queued=s_pio_fifo_full=s_pio_stale=0;
+    s_gate_romsel=s_gate_wramsel=s_gate_ctrl=0;
     s_drive_budget=0; s_arm_wait_pass=false;
     s_sample_last_off=0; s_sample_last_got=s_sample_last_exp=0; s_expected_off=0x6000u;
     s_last_off=0; s_last_data=0;
@@ -101,8 +135,30 @@ static void clear_state(void){
 
 void cx4bus_init(void){
     clear_state(); s_arm_request=false; s_arm_pending=false; s_driving=false; s_reset_requested=false;
-    const unsigned pins[8]={2,3,4,6,7,8,9,10};
-    for(unsigned i=0;i<8;i++){ gpio_set_function(pins[i],GPIO_FUNC_SIO); gpio_set_dir(pins[i],GPIO_IN); gpio_disable_pulls(pins[i]); }
+
+    /* PIO0 SM2 owns only the DATA output path. The existing PIO0 capture SMs
+       can still observe the pad inputs while SM2 controls output value/OE. */
+    for(unsigned pin=2; pin<=10; ++pin){
+        gpio_disable_pulls(pin);
+        pio_gpio_init(s_drive_pio, pin);
+    }
+    if(pio_can_add_program(s_drive_pio, &snes_bus_drive_program)){
+        uint off = pio_add_program(s_drive_pio, &snes_bus_drive_program);
+        pio_sm_config c = snes_bus_drive_program_get_default_config(off);
+        sm_config_set_out_pins(&c, 2, 9);
+        sm_config_set_jmp_pin(&c, PIN_PHI2);
+        sm_config_set_out_shift(&c, true, false, 32);
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+        int rc = pio_sm_init(s_drive_pio, s_drive_sm, off, &c);
+        pio_sm_set_consecutive_pindirs(s_drive_pio, s_drive_sm, 2, 9, false);
+        pio_sm_clear_fifos(s_drive_pio, s_drive_sm);
+        pio_sm_set_enabled(s_drive_pio, s_drive_sm, rc == 0);
+        s_drive_ready = (rc == 0);
+        printf("PIO drive: sm=%u off=%u init=%d ready=%u\n", s_drive_sm, off, rc, s_drive_ready?1u:0u);
+    }else{
+        s_drive_ready=false;
+        printf("PIO drive: ERROR no instruction memory; active readback disabled\n");
+    }
     data_release();
 }
 void cx4bus_arm(bool e){
@@ -128,7 +184,7 @@ void cx4bus_reset_state(void){ s_reset_requested=true; }
 
 static void __not_in_flash_func(core1_loop)(void){
     /*
-     * v0.9.1: synchronized one-pass active-read validator.
+     * v1.0: synchronized one-pass validator with PIO-owned output-enable.
      *
      * BUSARM does not enable outputs immediately. The test-ROM mailbox starts
      * the responder only at phase $30 (start of the NEXT complete read pass)
@@ -140,8 +196,13 @@ static void __not_in_flash_func(core1_loop)(void){
      * from the known write-capture losses.
      *
      * Timing:
-     *   PHI2 rises -> short settle -> wait /RD low while PHI2 high -> sample
-     *   stable address once -> drive expected byte -> PHI2 falls -> release.
+     *   core1: PHI2 rises -> /RD low -> address/control decode -> queue byte.
+     *   PIO0 SM2: verify PHI2 still high -> assert D0-D7 OE -> wait for the
+     *   PHI2 falling edge -> remove OE deterministically.
+     *
+     * /ROMSEL and /WRAMSEL must both be inactive immediately before queueing.
+     * This prevents a stale address sample from ever driving during ROM opcode
+     * fetches or WRAM cycles.
      */
     s_core1_started=true;
     data_release();
@@ -195,8 +256,33 @@ static void __not_in_flash_func(core1_loop)(void){
             prev_phi=false;
             continue;
         }
-        if((sio_hw->gpio_in & PHI2_MASK)==0u){
+        /* Final current-cycle guard. Address was sampled once after /RD, but
+           these control signals are re-read immediately before the FIFO push.
+           A target CX4/test-RAM read has /RD=0, /WR=1, /ROMSEL=1 and
+           /WRAMSEL=1. ROM or WRAM cycles can therefore never be driven even if
+           an address sample is stale near a bus transition. */
+        uint32_t lo_now=sio_hw->gpio_in;
+        uint32_t hi_now=sio_hw->gpio_hi_in;
+        if((lo_now & PHI2_MASK)==0u){
             s_too_late++;
+            prev_phi=false;
+            continue;
+        }
+        if((hi_now & RD_HI_MASK)!=0u || (lo_now & WR_MASK)==0u){
+            s_gate_ctrl++;
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
+        if((hi_now & ROMSEL_HI_MASK)==0u){
+            s_gate_romsel++;
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
+        if((hi_now & WRAMSEL_HI_MASK)==0u){
+            s_gate_wramsel++;
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
@@ -210,23 +296,33 @@ static void __not_in_flash_func(core1_loop)(void){
         }
 
         uint8_t v=expected_data(off);
+        if(!queue_drive(v)){
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
         s_cpu_r++; s_rd_safe++; s_phi_target++; s_phi_target_rd++;
         s_active_target++;
         s_last_off=off; s_last_data=v;
-        data_drive(v);
         s_driven++;
         s_drive_budget--;
 
-        __asm volatile("nop\n nop\n");
-        uint8_t echo=raw_data(sio_hw->gpio_in);
-        s_echo_target++;
-        if(echo==v) s_echo_match++;
-        else { s_echo_bad++; s_active_echo_bad++; }
+        /* Give PIO enough clocks to execute OUT + OE, then sample only while
+           the same PHI2 high phase is still alive. This is diagnostic only;
+           PIO owns release timing regardless of this check. */
+        __asm volatile("nop\n nop\n nop\n nop\n nop\n nop\n");
+        if((sio_hw->gpio_in & PHI2_MASK)!=0u){
+            uint8_t echo=raw_data(sio_hw->gpio_in);
+            s_echo_target++;
+            if(echo==v) s_echo_match++;
+            else { s_echo_bad++; s_active_echo_bad++; }
+        }else{
+            s_pio_stale++;
+        }
 
-        /* Data is required at the PHI2 falling edge. Release as soon as the RP
-           observes that edge; no extra hold loop and no wait for /RD release. */
         while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
-        data_release();
+        /* SM2 releases OE at the edge in hardware; this flag is informational. */
+        s_driving=false;
         s_fixed_hold++;
         prev_phi=false;
     }
@@ -350,12 +446,13 @@ void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=
 void cx4bus_print_runs(void){ printf("BUSREG seq=%u index=%lu bad=%lu expected=7F49:00 7F4A:80 7F4B:02 7F4D:0E 7F4E:00 7F4F:5C\n",s_seq,(unsigned long)s_reg_index,(unsigned long)s_reg_bad); }
 void cx4bus_selfcheck(void){ printf("BUSTEST ROM expected: test_rom/CX4_BUS_TEST.sfc (no injected game ROM required)\n"); }
 void cx4bus_print_status(void){
-    printf("BUSSTAT mode=BUS_VALIDATOR_V0.9.1_SYNC_PASS arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
+    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0_PIO_OE arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
            "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu bad_data_total=%llu bad_addr_total=%llu missing_total=%llu extra_total=%llu "
            "reg_passes=%llu reg_index=%lu reg_bad=%lu read_passes=%llu cur_err=%u last_err=%u read_good=%llu read_bad=%llu "
            "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu "
            "too_late=%llu cpu_r=%llu driven=%llu budget=%lu budget_cut=%llu auto_disarm=%llu edge_release=%llu "
            "active_passes=%llu active_last_err=%u active_target=%llu active_echo_bad=%llu "
+           "pio_ready=%u pio_q=%llu pio_full=%llu pio_stale=%llu gate_rom=%llu gate_wram=%llu gate_ctrl=%llu "
            "echo=%llu/%llu bad=%llu sample=%llu/%llu bad=%llu sample_last=%04X:%02X/%02X "
            "first_bad=%04lX/%04lX:%02X/%02X last=%04X:%02X\n",
            s_arm_request?1u:0u,s_arm_pending?1u:0u,(s_arm_request&&s_magic)?1u:0u,s_driving?"ON":"OFF",s_magic?1u:0u,s_seq,s_phase,
@@ -373,6 +470,8 @@ void cx4bus_print_status(void){
            (unsigned long long)s_cpu_r,(unsigned long long)s_driven,(unsigned long)s_drive_budget,
            (unsigned long long)s_budget_cut,(unsigned long long)s_auto_disarm,(unsigned long long)s_fixed_hold,
            (unsigned long long)s_active_passes,(unsigned)s_active_last_err,(unsigned long long)s_active_target,(unsigned long long)s_active_echo_bad,
+           s_drive_ready?1u:0u,(unsigned long long)s_pio_queued,(unsigned long long)s_pio_fifo_full,(unsigned long long)s_pio_stale,
+           (unsigned long long)s_gate_romsel,(unsigned long long)s_gate_wramsel,(unsigned long long)s_gate_ctrl,
            (unsigned long long)s_echo_match,(unsigned long long)s_echo_target,(unsigned long long)s_echo_bad,
            (unsigned long long)s_sample_match,(unsigned long long)s_sample_target,(unsigned long long)s_sample_bad,
            s_sample_last_off,s_sample_last_got,s_sample_last_exp,

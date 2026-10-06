@@ -1,0 +1,31 @@
+.pio_version 1
+.program snes_bus_drive
+; PIO0 SM2, GPIO base = 0.
+; GP2..GP10 are one contiguous 9-pin window:
+;   bits 0..2 = D0..D2
+;   bit 3     = unused GP5
+;   bits 4..8 = D3..D7
+;
+; TX word layout (shift-right):
+;   bits 0..8   = output levels for GP2..GP10
+;   bits 9..17  = output-enable mask (normally 0x1FF)
+;
+; Core1 only queues a word after strict address/control gating. PIO owns the
+; critical output-enable timing. If PHI2 has already fallen, the word is
+; discarded without ever enabling the pins. Once enabled, OE is removed a
+; deterministic two PIO clocks after PHI2 falls.
+
+.wrap_target
+    pull block
+    jmp pin phi_ok_1
+    jmp wrap_target
+phi_ok_1:
+    out pins, 9
+    jmp pin phi_ok_2
+    jmp wrap_target
+phi_ok_2:
+    out pindirs, 9
+    wait 0 gpio 0
+    mov osr, null
+    out pindirs, 9
+.wrap

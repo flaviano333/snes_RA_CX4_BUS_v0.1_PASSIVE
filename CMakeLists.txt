@@ -12,6 +12,7 @@ pico_generate_pio_header(snes_rp2350b_bus_validator ${CMAKE_CURRENT_LIST_DIR}/ca
 pico_generate_pio_header(snes_rp2350b_bus_validator ${CMAKE_CURRENT_LIST_DIR}/capture_read_trigger.pio)
 pico_generate_pio_header(snes_rp2350b_bus_validator ${CMAKE_CURRENT_LIST_DIR}/capture_read_low.pio)
 pico_generate_pio_header(snes_rp2350b_bus_validator ${CMAKE_CURRENT_LIST_DIR}/capture_read_high.pio)
+pico_generate_pio_header(snes_rp2350b_bus_validator ${CMAKE_CURRENT_LIST_DIR}/bus_drive.pio)
 target_link_libraries(snes_rp2350b_bus_validator pico_stdlib pico_multicore hardware_pio hardware_dma hardware_gpio m)
 pico_enable_stdio_usb(snes_rp2350b_bus_validator 1)
 pico_enable_stdio_uart(snes_rp2350b_bus_validator 0)
