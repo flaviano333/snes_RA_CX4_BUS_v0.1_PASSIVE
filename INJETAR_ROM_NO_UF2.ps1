@@ -1,16 +1,15 @@
-#ifndef CX4_ACTIVE_BUS_H
-#define CX4_ACTIVE_BUS_H
-#include <stdbool.h>
-#include <stdint.h>
-void cx4bus_init(void);
-void cx4bus_launch_core1(void);
-void cx4bus_service(void);
-void cx4bus_pio_write(uint32_t address, uint8_t data);
-void cx4bus_arm(bool enabled);
-bool cx4bus_is_armed(void);
-void cx4bus_reset_state(void);
-void cx4bus_print_status(void);
-void cx4bus_print_trace(void);
-void cx4bus_print_runs(void);
-void cx4bus_selfcheck(void);
-#endif
+param(
+    [Parameter(Mandatory=$true)][string]$Uf2Path,
+    [Parameter(Mandatory=$true)][string]$RomPath,
+    [string]$OutputPath = ""
+)
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
+if (-not (Test-Path $Uf2Path)) { throw "UF2 nao encontrado: $Uf2Path" }
+if (-not (Test-Path $RomPath)) { throw "ROM nao encontrada: $RomPath" }
+if ($OutputPath) {
+    py -3 tools/inject_rom_into_uf2.py "$Uf2Path" "$RomPath" -o "$OutputPath"
+} else {
+    py -3 tools/inject_rom_into_uf2.py "$Uf2Path" "$RomPath"
+}

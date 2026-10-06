@@ -1,24 +1,31 @@
-.pio_version 1
-.program snes_capture_high
-; RP2350 PIO1, GPIO base = 16
-;
-; GP21     = A9
-; GP22     = dummy / unused
-; GP23-25  = A11-A13
-; GP26     = dummy / unusable
-; GP27-34  = A14-A21
-; GP35     = /RD dummy in sampled window
-; GP36-37  = A22-A23
-; GP38     = /ROMSEL dummy in sampled window
-; GP39     = /WRAMSEL (active-low qualifier; consumed by C)
-; GP40     = A10
-;
-; in_base = GP21. IN PINS,20 reads GP21..GP40.
-; C reconstructs A9..A23 and takes A10 specifically from GP40.
-;
-.wrap_target
-    wait 1 irq 0           ; event sent internally by PIO0, no jumper needed
-    mov isr, null
-    in pins, 20            ; A8,A9,dummy,A10..A23
-    push block
-.wrap
+cmake_minimum_required(VERSION 3.13)
+set(PICO_BOARD spotpear_rp2350b_mini_a CACHE STRING "RP2350B board")
+set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards CACHE STRING "Custom board headers")
+include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+project(cx4_last_try C CXX ASM)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+pico_sdk_init()
+
+if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.c" OR
+   NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/cx4.h")
+  message(FATAL_ERROR "CX4 core missing. Build with the included GitHub Actions workflow.")
+endif()
+
+add_executable(cx4_last_try
+    main.c
+    cx4_active_bus.c
+    third_party/cx4.c
+)
+target_include_directories(cx4_last_try PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
+pico_generate_pio_header(cx4_last_try ${CMAKE_CURRENT_LIST_DIR}/capture_low.pio)
+pico_generate_pio_header(cx4_last_try ${CMAKE_CURRENT_LIST_DIR}/capture_high.pio)
+target_link_libraries(cx4_last_try pico_stdlib pico_multicore hardware_pio hardware_dma hardware_gpio hardware_clocks m)
+pico_enable_stdio_usb(cx4_last_try 1)
+pico_enable_stdio_uart(cx4_last_try 0)
+target_compile_definitions(cx4_last_try PRIVATE PICO_PIO_USE_GPIO_BASE=1)
+target_compile_options(cx4_last_try PRIVATE -O3)
+pico_add_extra_outputs(cx4_last_try)
