@@ -16,13 +16,14 @@
 ; deterministic two PIO clocks after PHI2 falls.
 
 .wrap_target
+loop:
     pull block
     jmp pin phi_ok_1
-    jmp wrap_target
+    jmp loop
 phi_ok_1:
     out pins, 9
     jmp pin phi_ok_2
-    jmp wrap_target
+    jmp loop
 phi_ok_2:
     out pindirs, 9
     wait 0 gpio 0

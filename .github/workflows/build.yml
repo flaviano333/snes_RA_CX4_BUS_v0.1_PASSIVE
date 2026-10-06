@@ -1,4 +1,4 @@
-name: Build BUS VALIDATOR v1.0 PIO-OE
+name: Build BUS VALIDATOR v1.0.1 PIO-OE
 on:
   workflow_dispatch:
   push:
@@ -23,8 +23,8 @@ jobs:
         run: cmake -S . -B build -G Ninja
       - name: Build
         run: cmake --build build
-      - run: cp build/snes_rp2350b_bus_validator.uf2 build/BUS_VALIDATOR_v1.0_PIO_OE.uf2
+      - run: cp build/snes_rp2350b_bus_validator.uf2 build/BUS_VALIDATOR_v1.0.1_PIO_OE.uf2
       - uses: actions/upload-artifact@v4
         with:
-          name: bus-validator-v1.0-pio-oe
-          path: build/BUS_VALIDATOR_v1.0_PIO_OE.uf2
+          name: bus-validator-v1.0.1-pio-oe
+          path: build/BUS_VALIDATOR_v1.0.1_PIO_OE.uf2

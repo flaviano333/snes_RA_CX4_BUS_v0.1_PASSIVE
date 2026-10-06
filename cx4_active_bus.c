@@ -9,7 +9,7 @@
 #include "bus_drive.pio.h"
 
 /*
- * v1.0 PIO-OE + SYNCHRONIZED ONE-PASS RESPONDER
+ * v1.0.1 PIO-OE + SYNCHRONIZED ONE-PASS RESPONDER
  *
  * This deliberately does NOT emulate CX4. It validates the electrical/data
  * path with a deterministic test ROM. PIO+DMA is authoritative for writes.
@@ -446,7 +446,7 @@ void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=
 void cx4bus_print_runs(void){ printf("BUSREG seq=%u index=%lu bad=%lu expected=7F49:00 7F4A:80 7F4B:02 7F4D:0E 7F4E:00 7F4F:5C\n",s_seq,(unsigned long)s_reg_index,(unsigned long)s_reg_bad); }
 void cx4bus_selfcheck(void){ printf("BUSTEST ROM expected: test_rom/CX4_BUS_TEST.sfc (no injected game ROM required)\n"); }
 void cx4bus_print_status(void){
-    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0_PIO_OE arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
+    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.1_PIO_OE arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
            "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu bad_data_total=%llu bad_addr_total=%llu missing_total=%llu extra_total=%llu "
            "reg_passes=%llu reg_index=%lu reg_bad=%lu read_passes=%llu cur_err=%u last_err=%u read_good=%llu read_bad=%llu "
            "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu "
