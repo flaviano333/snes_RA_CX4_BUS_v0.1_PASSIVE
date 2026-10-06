@@ -731,13 +731,13 @@ static void print_help(void) {
     printf("  WMSTATE                 show $2180-$2183 pointer/counters\n");
     printf("  WRAMSEL                 show v2.0 /WRAMSEL + READ-REPAIR counters\n");
     printf("  CHEESE                  show $1558/$155C values and targeted counters\n");
-    printf("  CX4STAT                 show active CX4 bus/interface counters\n");
-    printf("  CX4TRACE                show last 64 active CX4 IO reads/writes\n");
-    printf("  CX4RUNS                 show recent HG51B program starts (base/PB/PC)\n");
-    printf("  CX4SELF                 run local ROM/core diagnostic without SNES bus\n");
-    printf("  CX4ARM                  ENABLE D0-D7 response for CX4 reads (then reset SNES)\n");
-    printf("  CX4DISARM               disable active response; D0-D7 immediately INPUT\n");
-    printf("  CX4RESET                reset virtual CX4 state without changing armed state\n");
+    printf("  BUSSTAT                 show deterministic bus-test counters\n");
+    printf("  BUSTRACE                show last bus-test access/phase\n");
+    printf("  BUSREG                  show register-sequence validation\n");
+    printf("  BUSTEST                 show expected test ROM name\n");
+    printf("  BUSARM                  enable readback ONLY for BUS6 test ROM $00:6000-$6BFF\n");
+    printf("  BUSDISARM               disable active response; D0-D7 immediately INPUT\n");
+    printf("  BUSRESET                clear validator state without changing arm request\n");
     printf("  PING                    reply PONG\n");
     printf("Mirror source: /WRAMSEL-qualified writes + qualified A-bus READ-REPAIR + conservative WMDATA ($2180).\n");
     printf("DEBUG is diagnostic only: use it in PuTTY with the Python RA bridge closed.\n");
@@ -1098,23 +1098,23 @@ static void execute_command(char *line) {
         command_wramsel();
     } else if (!strcmp(cmd, "CHEESE")) {
         command_cheese();
-    } else if (!strcmp(cmd, "CX4STAT")) {
+    } else if (!strcmp(cmd, "BUSSTAT")) {
         cx4bus_print_status();
-    } else if (!strcmp(cmd, "CX4TRACE")) {
+    } else if (!strcmp(cmd, "BUSTRACE")) {
         cx4bus_print_trace();
-    } else if (!strcmp(cmd, "CX4RUNS")) {
+    } else if (!strcmp(cmd, "BUSREG")) {
         cx4bus_print_runs();
-    } else if (!strcmp(cmd, "CX4SELF")) {
+    } else if (!strcmp(cmd, "BUSTEST")) {
         cx4bus_selfcheck();
-    } else if (!strcmp(cmd, "CX4ARM")) {
+    } else if (!strcmp(cmd, "BUSARM")) {
         cx4bus_arm(true);
-        printf("OK CX4 ACTIVE armed. D0-D7 are driven ONLY on decoded CX4 reads. Reset the SNES now.\n");
-    } else if (!strcmp(cmd, "CX4DISARM")) {
+        printf("OK BUS readback requested. Drive remains gated until BUS6 test ROM magic is seen.\n");
+    } else if (!strcmp(cmd, "BUSDISARM")) {
         cx4bus_arm(false);
-        printf("OK CX4 ACTIVE disarmed; D0-D7 released to INPUT.\n");
-    } else if (!strcmp(cmd, "CX4RESET")) {
+        printf("OK BUS readback disabled; D0-D7 released to INPUT.\n");
+    } else if (!strcmp(cmd, "BUSRESET")) {
         cx4bus_reset_state();
-        printf("OK virtual CX4 state reset.\n");
+        printf("OK BUS validator state reset.\n");
     } else {
         printf("ERR unknown command '%s' (type HELP)\n", cmd);
     }
@@ -1247,14 +1247,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + CX4 BUS v0.5 HLE-GAMEPLAY ISOLATED ===\n");
+    printf("\n=== SNES RP2350B RA + BUS VALIDATOR v0.6 ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
     printf("A11..A13=GP23..25; GP26=SKIP; A14..A21=GP27..34; /RD=GP35.\n");
     printf("A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39.\n");
     printf("GP39=/WRAMSEL is ACTIVE in v2.0; GP40 remains A10.\n");
-    printf("Type HELP for commands. CX4 active responder starts DISARMED; use CX4ARM then reset SNES.\n\n");
+    printf("Type HELP for commands. BUS readback starts DISARMED and is gated by the BUS6 test ROM magic.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 40; ++pin) {
@@ -1340,9 +1340,8 @@ int main(void) {
         }
     }
 
-    // CX4 v0.2: switch only D0-D7 to SIO for core1-controlled tri-state output.
-    // RP2350 input paths remain visible to PIO, so the proven RA capture can keep
-    // sampling those pins even though SIO owns their output mux. Starts disarmed.
+    // BUS validator: D0-D7 are SIO-owned for a tightly gated readback test.
+    // PIO still observes input state. No CX4 emulation runs in this firmware.
     cx4bus_init();
 
     int dma_lo = dma_claim_unused_channel(true);
@@ -1385,7 +1384,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; CX4 BUS v0.5 HLE-GAMEPLAY ISOLATED available; drive starts OFF.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; BUS VALIDATOR v0.6 available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
