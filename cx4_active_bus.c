@@ -11,7 +11,7 @@
 #include "cx4.h"
 
 /*
- * CX4 BOOTBACK HLE EXACT-OAM V2
+ * CX4 BOOTBACK HLE BUSY-SYNC V3
  *
  * Goal: make the CPU-visible CX4 state deterministic for gameplay bring-up.
  * Runtime HG51B LLE is deliberately NOT connected to the CPU-visible C4RAM.
@@ -101,6 +101,29 @@ static volatile uint64_t s_hle_math_jobs = 0;
 static volatile uint64_t s_hle_test_jobs = 0;
 static volatile uint64_t s_hle_unhandled = 0;
 
+/* Hardware-visible command synchronization. Core1 raises BUSY as soon as it
+ * sees a qualified write to $7F4F. Core0 clears BUSY only after the HLE result
+ * is fully committed to s_c4ram. This mirrors the real chip's command barrier
+ * and prevents the SNES CPU from reading half-written OAM/results. */
+static volatile uint8_t s_hle_busy = 0;
+static volatile uint64_t s_busy_arms = 0;
+static volatile uint64_t s_busy_clears = 0;
+static volatile uint64_t s_busy_status_reads = 0;
+static volatile uint64_t s_busy_rearms = 0;
+static volatile uint8_t s_unhandled_last_cmd = 0xffu;
+static volatile uint8_t s_unhandled_last_sub = 0xffu;
+
+static inline void hle_busy_set(void) {
+    uint8_t old = __atomic_exchange_n(&s_hle_busy, 1u, __ATOMIC_ACQ_REL);
+    if (old) s_busy_rearms++; else s_busy_arms++;
+}
+static inline void hle_busy_clear(void) {
+    if (__atomic_exchange_n(&s_hle_busy, 0u, __ATOMIC_ACQ_REL)) s_busy_clears++;
+}
+static inline bool hle_busy_get(void) {
+    return __atomic_load_n(&s_hle_busy, __ATOMIC_ACQUIRE) != 0u;
+}
+
 /* These three are invariants explicitly checked by Snes9x's C4 debugger. */
 static volatile uint64_t s_inv625_bad = 0;
 static volatile uint64_t s_inv629_bad = 0;
@@ -185,7 +208,10 @@ static inline uint16_t ram_index_from_off(uint16_t off) {
 
 /* CPU-visible read. Match old HLE behavior for status: $7F5E is ready. */
 static inline uint8_t bus_read(uint16_t off) {
-    if (off == 0x7f5eu) return 0u;
+    if (off == 0x7f5eu) {
+        if (hle_busy_get()) { s_busy_status_reads++; return 0x80u; }
+        return 0u;
+    }
     if (off >= 0x7000u && off <= 0x7bffu)
         return s_c4ram[(off - 0x7000u) & 0x0fffu];
     return s_c4ram[ram_index_from_off(off) & 0x1fffu];
@@ -446,17 +472,26 @@ static void hle_math_command(uint8_t cmd) {
 
 static void hle_on_command(uint16_t off, uint8_t data) {
     if (off != 0x7f4fu) return;
+
+    /* Core1 normally raises BUSY at the physical write edge. Raise it here as
+     * well so replay/self-test paths and any missed early observation remain
+     * safe. BUSY is released on every command exit below. */
+    hle_busy_set();
     s_hle_last_sub = s_c4ram[0x1f4du];
 
     /* Legacy C4 HLE self-test behavior used by games/emulators. */
     if (s_hle_last_sub == 0x0eu && data < 0x40u && (data & 3u) == 0u) {
         s_c4ram[0x1f80u] = (uint8_t)(data >> 2);
         s_hle_test_jobs++;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        hle_busy_clear();
         return;
     }
 
     if (data == 0x00u && s_hle_last_sub == 0x00u) {
         (void)hle_conv_oam();
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        hle_busy_clear();
         return;
     }
 
@@ -465,11 +500,16 @@ static void hle_on_command(uint16_t off, uint8_t data) {
         case 0x05: case 0x0d: case 0x10: case 0x13:
         case 0x15: case 0x1f: case 0x25: case 0x2d:
             hle_math_command(data);
-            return;
+            break;
         default:
             s_hle_unhandled++;
-            return;
+            s_unhandled_last_cmd = data;
+            s_unhandled_last_sub = s_hle_last_sub;
+            break;
     }
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    hle_busy_clear();
 }
 
 static void clear_runtime_state(void) {
@@ -480,6 +520,9 @@ static void clear_runtime_state(void) {
     s_hle_groups = s_hle_oam = s_hle_longparts = s_hle_zero_ptr = 0;
     s_hle_pmax = 0; s_hle_last_ptr = 0; s_hle_last_sub = 0xffu;
     s_hle_math_jobs = s_hle_test_jobs = s_hle_unhandled = 0;
+    __atomic_store_n(&s_hle_busy, 0u, __ATOMIC_RELEASE);
+    s_busy_arms = s_busy_clears = s_busy_status_reads = s_busy_rearms = 0;
+    s_unhandled_last_cmd = s_unhandled_last_sub = 0xffu;
     s_inv625_bad = s_inv629_bad = s_inv627_bad = 0;
     s_inv_last_625 = s_inv_last_626 = s_inv_last_629 = 0; s_inv_last_627 = 0;
     s_trace_seq = 0;
@@ -543,6 +586,10 @@ static void __not_in_flash_func(core1_loop)(void) {
 
         if (wr && raw_is_cx4(lo, hi)) {
             uint16_t off = raw_cx4_offset(lo, hi);
+            const bool ctrl_ok_w =
+                ((hi & ROMSEL_HI_MASK) != 0u) &&
+                ((hi & WRAMSEL_HI_MASK) != 0u);
+            if (ctrl_ok_w && off == 0x7f4fu) hle_busy_set();
             __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
             uint8_t v = raw_data(sio_hw->gpio_in);
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
@@ -626,8 +673,8 @@ void cx4bus_selfcheck(void) {
 }
 
 void cx4bus_print_status(void) {
-    printf("CX4STAT mode=BOOTBACK_HLE_EXACT_OAM_V2 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
-           "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X "
+    printf("CX4STAT mode=BOOTBACK_HLE_BUSY_SYNC_V3 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
+           "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X busy=%u busy_arm=%llu busy_clear=%llu busy_reads=%llu busy_rearm=%llu unh_last=%02X/%02X "
            "inv625_bad=%llu inv629_bad=%llu inv627_bad=%llu inv_last=%02X/%02X/%02X/%04X "
            "pio_w=%llu pio_ram=%llu pio_io=%llu cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
            s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_rom_slot_valid?1u:0u,
@@ -635,6 +682,7 @@ void cx4bus_print_status(void) {
            (unsigned long long)s_hle_jobs,(unsigned long long)s_hle_good_jobs,(unsigned long long)s_hle_rejected_jobs,
            (unsigned long long)s_hle_groups,(unsigned long long)s_hle_oam,(unsigned long long)s_hle_math_jobs,(unsigned long long)s_hle_test_jobs,(unsigned long long)s_hle_unhandled,(unsigned long)s_hle_pmax,
            (unsigned long long)s_hle_longparts,(unsigned long long)s_hle_zero_ptr,(unsigned long)s_hle_last_ptr,s_hle_last_sub,
+           hle_busy_get()?1u:0u,(unsigned long long)s_busy_arms,(unsigned long long)s_busy_clears,(unsigned long long)s_busy_status_reads,(unsigned long long)s_busy_rearms,s_unhandled_last_cmd,s_unhandled_last_sub,
            (unsigned long long)s_inv625_bad,(unsigned long long)s_inv629_bad,(unsigned long long)s_inv627_bad,
            s_inv_last_625,s_inv_last_626,s_inv_last_629,s_inv_last_627,
            (unsigned long long)s_pio_writes,(unsigned long long)s_pio_ram_writes,(unsigned long long)s_pio_io_writes,
