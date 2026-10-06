@@ -1,6 +1,6 @@
 from pathlib import Path
 
-ROM_SIZE = 0x8000  # 32 KiB LoROM, mapped at bank 00:$8000-$FFFF
+ROM_SIZE = 0x80000  # 512 KiB LoROM for conservative flash-cart compatibility
 BASE_ADDR = 0x8000
 
 class A:
@@ -33,12 +33,18 @@ a.emit(0xA2,0xFF)         # LDX #$FF
 a.emit(0x9A)              # TXS
 a.emit(0xA9,0x00)         # LDA #0
 a.emit(0x8D,0x00,0x42)    # STA $4200 (NMI/IRQ off)
+# Visible boot marker: backdrop starts BLUE so a black screen means the ROM did not boot.
+a.emit(0xA9,0x80,0x8D,0x00,0x21)  # INIDISP forced blank
+a.emit(0xA9,0x00,0x8D,0x21,0x21)  # CGADD = color 0
+a.emit(0xA9,0x00,0x8D,0x22,0x21)  # BGR555 low: blue = $7C00
+a.emit(0xA9,0x7C,0x8D,0x22,0x21)  # BGR555 high
+a.emit(0xA9,0x0F,0x8D,0x00,0x21)  # display on, max brightness
 a.emit(0x85,0x00,0x85,0x01,0x85,0x02,0x85,0x03)  # clear zp 00-03
-# magic BUS6 at $7FF0-$7FF3
+a.label('main')
+# Robust handshake: emit BUS6 at the beginning of EVERY pass.
+# The RP validator may start after the SNES, so a one-shot boot signature is not sufficient.
 for addr,val in [(0x7ff0,ord('B')),(0x7ff1,ord('U')),(0x7ff2,ord('S')),(0x7ff3,ord('6'))]:
     a.emit(0xA9,val,0x8D,addr&0xff,addr>>8)
-
-a.label('main')
 a.emit(0xE6,0x02)         # INC sequence
 a.emit(0xA5,0x02,0x8D,0xF4,0x7F)  # seq -> $7FF4
 a.emit(0xA9,0x10,0x8D,0xF5,0x7F)  # phase WRITE
@@ -86,6 +92,18 @@ for page in range(12):
 a.emit(0xA5,0x00,0x8D,0xF6,0x7F)
 a.emit(0xA5,0x01,0x8D,0xF7,0x7F)
 a.emit(0xA9,0x40,0x8D,0xF5,0x7F)
+# Visual result: GREEN when active readback has zero errors, RED otherwise.
+a.emit(0xA5,0x00,0x05,0x01)      # LDA err_lo | err_hi
+a.bra(0xD0,'show_fail')            # BNE fail
+a.emit(0xA9,0x00,0x8D,0x21,0x21) # CGADD 0
+a.emit(0xA9,0xE0,0x8D,0x22,0x21) # green $03E0 low
+a.emit(0xA9,0x03,0x8D,0x22,0x21) # green high
+a.bra(0x80,'color_done')
+a.label('show_fail')
+a.emit(0xA9,0x00,0x8D,0x21,0x21) # CGADD 0
+a.emit(0xA9,0x1F,0x8D,0x22,0x21) # red $001F low
+a.emit(0xA9,0x00,0x8D,0x22,0x21) # red high
+a.label('color_done')
 # short deterministic delay so terminal status can be sampled without insane pass rate
 # Y isn't available in emulation? LDY/DEY fine, 8-bit. nested X/Y delay.
 a.emit(0xA0,0x20)          # LDY #$20
@@ -99,29 +117,40 @@ a.bra(0xD0,'delay_y')
 a.jmp('main')
 
 a.resolve()
+# Build one canonical 32 KiB LoROM bank, then mirror it across the 512 KiB
+# image. Some inexpensive flash carts are much happier with conventional ROM
+# sizes than with a bare 32 KiB image.
+bank=bytearray([0xff])*0x8000
+bank[:len(a.b)] = a.b
 rom=bytearray([0xff])*ROM_SIZE
-rom[:len(a.b)] = a.b
-# LoROM header at $7FC0.
+# LoROM header at $7FC0 in bank 0.
 header=0x7fc0
-title=b'CX4 BUS VALIDATOR V06 '
+title=b'CX4 BUS VALIDATOR 070 '
 title=title[:21].ljust(21,b' ')
-rom[header:header+21]=title
-rom[header+0x15]=0x20  # LoROM slow
-rom[header+0x16]=0x00  # ROM only
-rom[header+0x17]=0x05  # 32 KiB
-rom[header+0x18]=0x00  # SRAM none
-rom[header+0x19]=0x01  # region USA
-rom[header+0x1a]=0x00
-rom[header+0x1b]=0x00
+bank[header:header+21]=title
+bank[header+0x15]=0x20  # LoROM slow
+bank[header+0x16]=0x00  # ROM only
+bank[header+0x17]=0x09  # 512 KiB
+bank[header+0x18]=0x00  # SRAM none
+bank[header+0x19]=0x01  # region USA
+bank[header+0x1a]=0x00
+bank[header+0x1b]=0x00
 # vectors. Point all relevant vectors to reset entry to keep behavior deterministic.
 for off in [0x7fe4,0x7fe6,0x7fe8,0x7fea,0x7fec,0x7fee,0x7ff4,0x7ff6,0x7ff8,0x7ffa,0x7ffc,0x7ffe]:
-    rom[off]=BASE_ADDR&0xff; rom[off+1]=(BASE_ADDR>>8)&0xff
-# checksum fields zero while calculating, then set complement/checksum.
-rom[header+0x1c:header+0x20]=b'\x00\x00\x00\x00'
+    bank[off]=BASE_ADDR&0xff; bank[off+1]=(BASE_ADDR>>8)&0xff
+# Mirror the canonical bank throughout the image. This also places valid reset
+# vectors at every 32 KiB boundary, which makes the test tolerant of simple
+# flash-cart mirroring quirks.
+bank[header+0x1c:header+0x20]=b'\x00\x00\x00\x00'
+for off in range(0, ROM_SIZE, 0x8000):
+    rom[off:off+0x8000]=bank
+# Fill the canonical header checksum in every mirror.
 chk=sum(rom)&0xffff
 comp=chk^0xffff
-rom[header+0x1c]=comp&0xff; rom[header+0x1d]=comp>>8
-rom[header+0x1e]=chk&0xff; rom[header+0x1f]=chk>>8
+for off in range(0, ROM_SIZE, 0x8000):
+    h=off+header
+    rom[h+0x1c]=comp&0xff; rom[h+0x1d]=comp>>8
+    rom[h+0x1e]=chk&0xff; rom[h+0x1f]=chk>>8
 out=Path(__file__).with_name('CX4_BUS_TEST.sfc')
 out.write_bytes(rom)
-print(f'{out} {len(rom)} bytes code={len(a.b)} reset=${BASE_ADDR:04X} checksum={chk:04X}')
+print(f'{out} {len(rom)} bytes code={len(a.b)} reset=${BASE_ADDR:04X} checksum={chk:04X} visible=BLUE/RED/GREEN')

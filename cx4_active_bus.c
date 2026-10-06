@@ -7,7 +7,7 @@
 #include "hardware/structs/sio.h"
 
 /*
- * v0.6 BUS VALIDATOR
+ * v0.7 RD-EDGE RESPONDER
  *
  * This deliberately does NOT emulate CX4. It validates the electrical/data
  * path with a deterministic test ROM. PIO+DMA is authoritative for writes.
@@ -24,11 +24,16 @@
 static uint8_t s_ram[0x0c00];
 static volatile bool s_arm_request=false, s_driving=false, s_core1_started=false;
 static volatile bool s_reset_requested=false, s_magic=false;
-static volatile uint8_t s_magic_step=0, s_phase=0, s_seq=0;
+static volatile uint8_t s_magic_step=0, s_magic_mask=0, s_phase=0, s_seq=0;
+static volatile uint64_t s_magic_hits=0, s_magic_bad=0;
 
 static volatile uint64_t s_pio_w=0, s_cpu_r=0, s_driven=0;
+static volatile uint64_t s_rd_edges=0, s_rd_safe=0, s_rd_bank_miss=0, s_rd_range_miss=0;
 static volatile uint64_t s_passes=0, s_write_passes=0, s_reg_passes=0, s_read_passes=0;
 static volatile uint32_t s_write_seen=0, s_write_bad_data=0, s_write_bad_addr=0, s_write_count_bad=0;
+static volatile uint64_t s_write_bad_data_total=0, s_write_bad_addr_total=0, s_write_missing_total=0, s_write_extra_total=0;
+static volatile uint32_t s_first_bad_exp=0xffffffffu, s_first_bad_got=0xffffffffu;
+static volatile uint8_t s_first_bad_data=0, s_first_bad_expected_data=0;
 static volatile uint32_t s_reg_index=0, s_reg_bad=0;
 static volatile uint16_t s_read_errors=0xffffu;
 static volatile uint16_t s_expected_off=0x6000u;
@@ -64,9 +69,13 @@ static inline bool safe_test_read(uint32_t a){
 
 static void clear_state(void){
     memset(s_ram,0,sizeof(s_ram));
-    s_magic=false; s_magic_step=0; s_phase=0; s_seq=0;
+    s_magic=false; s_magic_step=0; s_magic_mask=0; s_phase=0; s_seq=0;
+    s_magic_hits=s_magic_bad=0;
+    s_rd_edges=s_rd_safe=s_rd_bank_miss=s_rd_range_miss=0;
     s_passes=s_write_passes=s_reg_passes=s_read_passes=0;
     s_write_seen=s_write_bad_data=s_write_bad_addr=s_write_count_bad=0;
+    s_write_bad_data_total=s_write_bad_addr_total=s_write_missing_total=s_write_extra_total=0;
+    s_first_bad_exp=s_first_bad_got=0xffffffffu; s_first_bad_data=s_first_bad_expected_data=0;
     s_reg_index=s_reg_bad=0; s_read_errors=0xffffu; s_expected_off=0x6000u;
     s_last_off=0; s_last_data=0;
 }
@@ -82,39 +91,73 @@ bool cx4bus_is_armed(void){ return s_arm_request; }
 void cx4bus_reset_state(void){ s_reset_requested=true; }
 
 static void __not_in_flash_func(core1_loop)(void){
-    s_core1_started=true; data_release();
+    /*
+     * v0.7: do NOT phase-lock the responder to PHI2 in C.
+     * The previous loop waited for a PHI2 low->high transition and only then
+     * sampled /RD. On the real SNES this missed essentially every test-ROM
+     * read (15 responses after millions of bus cycles).
+     *
+     * Instead, /RD itself is the event source. Address is sampled immediately
+     * after /RD asserts, data is driven only for the deliberately gated
+     * $00:6000-$6BFF test window, and D0-D7 are released as soon as /RD rises.
+     */
+    s_core1_started=true;
+    data_release();
     for(;;){
-        while(sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
-        while(!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
+        /* Wait for /RD falling edge. */
+        while((sio_hw->gpio_hi_in & RD_HI_MASK) != 0u) tight_loop_contents();
+        s_rd_edges++;
+
+        /* The SNES address bus is already valid when /RD is asserted. */
         __asm volatile("nop; nop;":::"memory");
-        uint32_t lo=sio_hw->gpio_in, hi=sio_hw->gpio_hi_in;
-        if((hi & RD_HI_MASK)==0u){
-            uint32_t a=raw_address24(lo,hi);
-            if(safe_test_read(a)){
+        uint32_t lo=sio_hw->gpio_in;
+        uint32_t hi=sio_hw->gpio_hi_in;
+        uint32_t a=raw_address24(lo,hi);
+
+        if(s_arm_request && s_magic){
+            if((a>>16)!=0x00u){
+                s_rd_bank_miss++;
+            }else if((uint16_t)a<0x6000u || (uint16_t)a>0x6bffu){
+                s_rd_range_miss++;
+            }else{
                 uint16_t off=(uint16_t)a;
                 uint8_t v=s_ram[off-0x6000u];
-                s_cpu_r++; s_last_off=off; s_last_data=v;
-                data_drive(v); s_driven++;
+                s_cpu_r++;
+                s_rd_safe++;
+                s_last_off=off;
+                s_last_data=v;
+                data_drive(v);
+                s_driven++;
             }
-            while(sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
-            if(s_driving)data_release();
-            continue;
         }
-        while(sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
+
+        /* Never hold the bus beyond the read strobe. */
+        while((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u) tight_loop_contents();
+        if(s_driving) data_release();
     }
 }
 void cx4bus_launch_core1(void){ if(s_core1_started)return; multicore_launch_core1(core1_loop); while(!s_core1_started)tight_loop_contents(); }
 
 static void finish_write_phase(void){
     s_write_passes++;
-    if(s_write_seen!=0x0c00u) s_write_count_bad++;
+    if(s_write_seen!=0x0c00u){
+        s_write_count_bad++;
+        if(s_write_seen<0x0c00u) s_write_missing_total += (uint64_t)(0x0c00u-s_write_seen);
+        else s_write_extra_total += (uint64_t)(s_write_seen-0x0c00u);
+    }
 }
 static void mailbox(uint16_t off,uint8_t data){
     if(off>=0x7ff0u && off<=0x7ff3u){
         const uint8_t m[4]={'B','U','S','6'};
         uint8_t idx=(uint8_t)(off-0x7ff0u);
-        if(idx==s_magic_step && data==m[idx]){ if(++s_magic_step==4)s_magic=true; }
-        else if(idx==0 && data=='B') s_magic_step=1; else s_magic_step=0;
+        if(data==m[idx]){
+            s_magic_mask |= (uint8_t)(1u<<idx);
+            s_magic_hits++;
+            if(s_magic_mask==0x0fu) s_magic=true;
+        }else{
+            s_magic_bad++;
+            s_magic_mask &= (uint8_t)~(1u<<idx);
+        }
         return;
     }
     if(!s_magic)return;
@@ -142,8 +185,17 @@ void cx4bus_pio_write(uint32_t address,uint8_t data){
     if(off>=0x6000u && off<=0x6bffu){
         s_ram[off-0x6000u]=data;
         if(s_magic && s_phase==0x10u){
-            if(off!=s_expected_off)s_write_bad_addr++;
-            if(data!=expected_data(off))s_write_bad_data++;
+            if(off!=s_expected_off){
+                s_write_bad_addr++; s_write_bad_addr_total++;
+                if(s_first_bad_exp==0xffffffffu){ s_first_bad_exp=s_expected_off; s_first_bad_got=off; }
+            }
+            uint8_t ev=expected_data(off);
+            if(data!=ev){
+                s_write_bad_data++; s_write_bad_data_total++;
+                if(s_first_bad_exp==0xffffffffu){
+                    s_first_bad_exp=off; s_first_bad_got=off; s_first_bad_data=data; s_first_bad_expected_data=ev;
+                }
+            }
             s_write_seen++;
             s_expected_off=(uint16_t)(off+1u);
         }
@@ -158,18 +210,24 @@ void cx4bus_pio_write(uint32_t address,uint8_t data){
 }
 
 void cx4bus_service(void){ if(s_reset_requested){ s_reset_requested=false; clear_state(); } }
-void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=%u\n",s_last_off,s_last_data,s_phase,s_magic?1u:0u); }
+void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=%u mask=%X hits=%llu bad=%llu\n",s_last_off,s_last_data,s_phase,s_magic?1u:0u,s_magic_mask,(unsigned long long)s_magic_hits,(unsigned long long)s_magic_bad); }
 void cx4bus_print_runs(void){ printf("BUSREG seq=%u index=%lu bad=%lu expected=7F49:00 7F4A:80 7F4B:02 7F4D:0E 7F4E:00 7F4F:5C\n",s_seq,(unsigned long)s_reg_index,(unsigned long)s_reg_bad); }
 void cx4bus_selfcheck(void){ printf("BUSTEST ROM expected: test_rom/CX4_BUS_TEST.sfc (no injected game ROM required)\n"); }
 void cx4bus_print_status(void){
-    printf("BUSSTAT mode=BUS_VALIDATOR_V0.6 arm=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
-           "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu "
+    printf("BUSSTAT mode=BUS_VALIDATOR_V0.7_RD_EDGE arm=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
+           "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu bad_data_total=%llu bad_addr_total=%llu missing_total=%llu extra_total=%llu "
            "reg_passes=%llu reg_index=%lu reg_bad=%lu read_passes=%llu snes_read_errors=%u "
-           "pio_w=%llu cpu_r=%llu driven=%llu last=%04X:%02X\n",
+           "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu cpu_r=%llu driven=%llu first_bad=%04lX/%04lX:%02X/%02X last=%04X:%02X\n",
            s_arm_request?1u:0u,(s_arm_request&&s_magic)?1u:0u,s_driving?"ON":"OFF",s_magic?1u:0u,s_seq,s_phase,
            (unsigned long long)s_passes,(unsigned long long)s_write_passes,(unsigned long)s_write_seen,
            (unsigned long)s_write_bad_data,(unsigned long)s_write_bad_addr,(unsigned long)s_write_count_bad,
+           (unsigned long long)s_write_bad_data_total,(unsigned long long)s_write_bad_addr_total,
+           (unsigned long long)s_write_missing_total,(unsigned long long)s_write_extra_total,
            (unsigned long long)s_reg_passes,(unsigned long)s_reg_index,(unsigned long)s_reg_bad,
-           (unsigned long long)s_read_passes,(unsigned)s_read_errors,
-           (unsigned long long)s_pio_w,(unsigned long long)s_cpu_r,(unsigned long long)s_driven,s_last_off,s_last_data);
+           (unsigned long long)s_read_passes,(unsigned)s_read_errors,s_magic_mask,(unsigned long long)s_magic_hits,(unsigned long long)s_magic_bad,
+           (unsigned long long)s_pio_w,(unsigned long long)s_rd_edges,(unsigned long long)s_rd_safe,
+           (unsigned long long)s_rd_bank_miss,(unsigned long long)s_rd_range_miss,
+           (unsigned long long)s_cpu_r,(unsigned long long)s_driven,
+           (unsigned long)s_first_bad_exp,(unsigned long)s_first_bad_got,s_first_bad_data,s_first_bad_expected_data,
+           s_last_off,s_last_data);
 }

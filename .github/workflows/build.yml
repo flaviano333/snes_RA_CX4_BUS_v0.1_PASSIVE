@@ -1,4 +1,4 @@
-name: Build BUS VALIDATOR v0.6
+name: Build BUS VALIDATOR v0.7 RD-EDGE
 on:
   workflow_dispatch:
   push:
@@ -23,8 +23,8 @@ jobs:
         run: cmake -S . -B build -G Ninja
       - name: Build
         run: cmake --build build
-      - run: cp build/snes_rp2350b_bus_validator.uf2 build/BUS_VALIDATOR_v0.6.uf2
+      - run: cp build/snes_rp2350b_bus_validator.uf2 build/BUS_VALIDATOR_v0.7_RD_EDGE.uf2
       - uses: actions/upload-artifact@v4
         with:
-          name: bus-validator-v0.6
-          path: build/BUS_VALIDATOR_v0.6.uf2
+          name: bus-validator-v0.7-rd-edge
+          path: build/BUS_VALIDATOR_v0.7_RD_EDGE.uf2
