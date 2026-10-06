@@ -12,7 +12,7 @@
 
 #include "capture_low.pio.h"
 #include "capture_high.pio.h"
-#include "master_clock.pio.h"
+#include "sysclk_counter.pio.h"
 #include "cx4_active_bus.h"
 
 #define PIN_PHI2       0u
@@ -22,8 +22,7 @@
 #define PIN_RD         35u
 #define PIN_ROMSEL     38u
 #define PIN_WRAMSEL    39u
-#define PIN_MASTER_CLK 41u
-#define PIN_RESET      42u
+#define PIN_MASTER_CLK  41u
 
 #define SAMPLE_COUNT 1024u
 #define GAMEPLAY_CLOCK_KHZ 150000u
@@ -37,10 +36,6 @@ static volatile uint32_t master_dma_sink = 0;
 static uint64_t master_blocks_base = 0;
 #define MASTER_BLOCK_CYCLES 1024ull
 #define MASTER_DMA_COUNT 0x0fffffffu
-static bool reset_mon_init = false;
-static bool reset_level_last = true;
-static uint64_t reset_asserts_passive = 0;
-static uint64_t reset_releases_passive = 0;
 static uint active_buf = 0;
 static uint64_t write_pairs_seen = 0;
 static uint64_t write_pairs_qualified = 0;
@@ -68,19 +63,6 @@ static void master_clock_rearm_if_needed(PIO pio_clk, uint sm_clk) {
     dma_channel_set_read_addr((uint)dma_clk, &pio_clk->rxf[sm_clk], false);
     dma_channel_set_write_addr((uint)dma_clk, (void *)&master_dma_sink, false);
     dma_channel_set_trans_count((uint)dma_clk, MASTER_DMA_COUNT, true);
-}
-
-static void reset_monitor_passive(void) {
-    bool level = gpio_get(PIN_RESET) != 0;
-    if (!reset_mon_init) {
-        reset_mon_init = true;
-        reset_level_last = level;
-        return;
-    }
-    if (level == reset_level_last) return;
-    if (level) reset_releases_passive++;
-    else reset_asserts_passive++;
-    reset_level_last = level;
 }
 
 static inline uint32_t unpack_low18(uint32_t raw) {
@@ -169,17 +151,14 @@ static void strtoupper_inplace(char *s) {
 static void command_info(void) {
     const uint64_t mt = master_clock_ticks();
     printf("LASTBUS clock_khz=%u write_pairs=%llu qualified=%llu rejected_ctrl=%llu rearms=%llu active_buf=%u scan=%lu/%u "
-           "sysclk_master=%llu reset=%s reset_passive=%llu/%llu\n",
+           "sysclk_master=%llu\n",
            GAMEPLAY_CLOCK_KHZ,
            (unsigned long long)write_pairs_seen,
            (unsigned long long)write_pairs_qualified,
            (unsigned long long)write_pairs_rejected_ctrl,
            (unsigned long long)dma_rearms,
            active_buf, (unsigned long)scan_pos[active_buf], SAMPLE_COUNT,
-           (unsigned long long)mt,
-           gpio_get(PIN_RESET) ? "HIGH" : "LOW",
-           (unsigned long long)reset_asserts_passive,
-           (unsigned long long)reset_releases_passive);
+           (unsigned long long)mt);
     cx4bus_print_status();
 }
 
@@ -222,21 +201,18 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 V4 + PASSIVE SYSCLK/RESET V6.1 ===\n");
-    printf("clock=%u kHz | EXACT V4 gameplay path + passive GP41/GP42 monitor\n", GAMEPLAY_CLOCK_KHZ);
-    printf("V4 pinout unchanged; NEW INPUT-ONLY: SYSTEM CLK=GP41, /RESET=GP42\n");
+    printf("\n=== SNES RP2350B CX4 SYSCLK-ONLY HYBRID V6.2.1 ===\n");
+    printf("clock=%u kHz | proven HLE boot path + exact LLE fallback\n", GAMEPLAY_CLOCK_KHZ);
+    printf("existing pinout preserved; NEW: SYSTEM CLK=GP41 only; GP42 /RESET is NOT USED and must remain disconnected\n");
     printf("write authority: PIO+DMA, qualified by /ROMSEL HIGH + /WRAMSEL HIGH\n");
     printf("read responder: preserved v0.5 PHI2 timing + /ROMSEL HIGH + /WRAMSEL HIGH + /WR HIGH\n");
-    printf("CX4 gameplay logic is byte-for-byte V4; GP41/GP42 DO NOT control CX4 yet, they are monitored only.\n\n");
+    printf("known commands use HLE; unhandled commands fall back to exact HG51B clocked from real SNES SYSTEM CLK; no hardware /RESET input is used.\n\n");
     fflush(stdout);
 
     for (uint pin=0; pin<=40u; ++pin) {
         configure_input(pin, pin==PIN_WR || pin==PIN_RD || pin==PIN_ROMSEL || pin==PIN_WRAMSEL);
     }
-    /* GP41/GP42 are deliberately INPUT-ONLY in V6.1. They are observed but
-       never used to drive, reset, arm, delay, or otherwise influence CX4. */
-    configure_input(PIN_MASTER_CLK, false);
-    configure_input(PIN_RESET, false);
+    /* GP41 is SYSTEM CLK. GP42 is intentionally untouched in this build. */
 
     PIO pio_lo = pio0;
     PIO pio_hi = pio1;
@@ -266,8 +242,8 @@ int main(void) {
     sm_config_set_fifo_join(&cfg_hi, PIO_FIFO_JOIN_RX);
     int init_hi = pio_sm_init(pio_hi, sm_hi, off_hi, &cfg_hi);
 
-    /* Passive-only SYSTEM CLK monitor. One DMA token represents 1024 complete
-       master-clock cycles. No interrupt and no feedback into the CX4 path. */
+    /* PIO2 counts the physical 21.477 MHz SNES master clock in blocks of 1024.
+       The RX FIFO is drained by DMA, so no CPU interrupt is needed per edge. */
     gpio_disable_pulls(PIN_MASTER_CLK);
     pio_gpio_init(pio_clk, PIN_MASTER_CLK);
     pio_sm_set_consecutive_pindirs(pio_clk, sm_clk, PIN_MASTER_CLK, 1, false);
@@ -277,7 +253,7 @@ int main(void) {
     sm_config_set_fifo_join(&cfg_clk, PIO_FIFO_JOIN_RX);
     int init_clk = pio_sm_init(pio_clk, sm_clk, off_clk, &cfg_clk);
 
-    printf("PIO write capture: base=%d/%d init=%d/%d | passive SYSCLK base=%d init=%d GP41\n",
+    printf("PIO write capture: base=%d/%d init=%d/%d | SYSCLK base=%d init=%d GP41\n",
            base_lo,base_hi,init_lo,init_hi,base_clk,init_clk);
     if (base_lo || base_hi || base_clk || init_lo || init_hi || init_clk) {
         printf("FATAL PIO init failed; DATA remains input.\n");
@@ -329,9 +305,8 @@ int main(void) {
     pio_sm_set_enabled(pio_hi,sm_hi,true);
     pio_sm_set_enabled(pio_lo,sm_lo,true);
 
-    reset_monitor_passive();
     cx4bus_launch_core1();
-    printf("READY V4 + PASSIVE SYSCLK/RESET V6.1. Gameplay path is unchanged from working V4.\n");
+    printf("READY SYSCLK-ONLY HYBRID V6.2.1. GP42 must be disconnected. Power/reset the SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {
@@ -339,8 +314,7 @@ int main(void) {
            register/RAM writes visible long before the 1024-sample DMA block fills. */
         feed_write_prefix(active_buf);
         master_clock_rearm_if_needed(pio_clk, sm_clk);
-        reset_monitor_passive();
-        cx4bus_service();
+        cx4bus_service(master_clock_ticks());
 
         if (dma_remaining((uint)dma_lo)==0u && dma_remaining((uint)dma_hi)==0u) {
             uint done=active_buf, next=done^1u;
@@ -357,8 +331,7 @@ int main(void) {
         }
 
         master_clock_rearm_if_needed(pio_clk, sm_clk);
-        reset_monitor_passive();
-        cx4bus_service();
+        cx4bus_service(master_clock_ticks());
         poll_serial();
         tight_loop_contents();
     }
