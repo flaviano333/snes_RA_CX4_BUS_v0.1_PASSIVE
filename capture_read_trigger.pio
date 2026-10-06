@@ -3,17 +3,28 @@
 ; RP2350B PIO2, GPIO base = 16
 ;
 ; Physical GP35 = CPU /RD
+; Physical GP38 = /ROMSEL
 ;
-; IMPORTANT:
-; WAIT GPIO indices are RELATIVE to the PIO GPIO base.
-; Therefore physical GP35 is index 35-16 = 19.
+; WAIT GPIO indices are RELATIVE to the PIO GPIO base:
+;   GP35 -> 19
+; JMP PIN is configured from C to physical GP38.
 ;
-; Detect one A-bus read cycle and notify PIO0 through cross-PIO IRQ1.
+; v1.0.6 ROMSEL HARDWARE GATE:
+;   IRQ2 (active D0-D7 responder) is published only when /ROMSEL is HIGH
+;   at the physical /RD falling edge. A genuine cartridge-ROM read has
+;   /ROMSEL LOW, so it can never receive the active-drive IRQ.
+;
+; IRQ1 remains unconditional so passive read capture still sees every read.
 ; PIO2 NEXT wraps to PIO0 on RP2350.
 
 .wrap_target
     wait 0 gpio 19         ; physical GP35 /RD asserted (active low)
-    irq next 1             ; set IRQ1 in PIO0
-    wait 1 gpio 19         ; physical GP35 released
+    jmp pin drive_allowed  ; jmp pin = physical GP38 /ROMSEL; HIGH only
+    jmp passive_only       ; /ROMSEL LOW => absolutely no active-drive IRQ
+ drive_allowed:
+    irq next 2             ; PIO0 IRQ2 -> preloaded D0-D7 responder
+ passive_only:
+    irq next 1             ; PIO0 IRQ1 -> passive read capture
+    wait 1 gpio 19         ; physical GP35 /RD released
     nop
 .wrap

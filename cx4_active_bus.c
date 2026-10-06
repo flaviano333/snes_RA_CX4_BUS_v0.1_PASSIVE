@@ -9,12 +9,14 @@
 #include "bus_drive.pio.h"
 
 /*
- * v1.0.4 RD-LATCH ADDRESS + PIO-OE ONE-PASS RESPONDER
+ * v1.0.6 PRELOAD + RD + ROMSEL HARDWARE-GATE ONE-PASS RESPONDER
  *
  * This deliberately does NOT emulate CX4. It validates the electrical/data
  * path with a deterministic test ROM. PIO+DMA is authoritative for writes.
- * Active readback is restricted to bank $00, $6000-$6BFF, and only after the
- * test ROM's BUS6 magic has been observed. This minimizes accidental drive.
+ * Active readback is restricted to bank $00, $6000-$6BFF, only after the
+ * test ROM's BUS6 magic has been observed, and only while /ROMSEL is HIGH.
+ * PIO2 enforces /ROMSEL HIGH in hardware at the /RD edge before it can publish
+ * the IRQ that lets PIO0 enable D0-D7.
  */
 #define PIN_PHI2 0u
 #define PIN_WR   1u
@@ -53,7 +55,14 @@ static volatile uint64_t s_auto_disarm=0, s_budget_cut=0;
 static volatile uint64_t s_active_passes=0, s_active_target=0, s_active_echo_bad=0;
 static volatile uint16_t s_active_last_err=0xffffu;
 static volatile uint64_t s_pio_queued=0, s_pio_fifo_full=0, s_pio_stale=0;
+static volatile uint64_t s_preload_seen=0, s_preload_cancel=0, s_preload_addr_change=0;
+static volatile uint64_t s_preload_no_rd=0, s_preload_miss=0, s_preload_unstable=0;
+static volatile uint64_t s_post_ok=0, s_post_bad=0, s_post_addr_mismatch=0;
+static volatile bool s_preload_live=false;
 static volatile uint64_t s_gate_romsel=0, s_gate_wramsel=0, s_gate_ctrl=0;
+static volatile uint64_t s_romsel_pre_high=0, s_romsel_pre_low=0;
+static volatile uint64_t s_romsel_rd_high=0, s_romsel_rd_low=0;
+static volatile uint64_t s_drive_during_rom=0;
 static volatile uint32_t s_drive_budget=0;
 static PIO s_drive_pio = pio0;
 static const uint s_drive_sm = 2u;
@@ -78,10 +87,12 @@ static void data_release(void){
     if(s_drive_ready){
         pio_sm_set_enabled(s_drive_pio, s_drive_sm, false);
         pio_sm_clear_fifos(s_drive_pio, s_drive_sm);
+        pio_interrupt_clear(s_drive_pio, 2);   /* discard any stale /RD gate */
         pio_sm_restart(s_drive_pio, s_drive_sm);
         pio_sm_set_consecutive_pindirs(s_drive_pio, s_drive_sm, 2, 9, false);
         pio_sm_set_enabled(s_drive_pio, s_drive_sm, true);
     }
+    s_preload_live=false;
     s_driving=false;
 }
 static inline bool queue_drive(uint8_t v){
@@ -89,9 +100,13 @@ static inline bool queue_drive(uint8_t v){
         s_pio_fifo_full++;
         return false;
     }
+
+    /* IRQ2 is cleared once at the beginning of each PHI2 cycle, before any
+       current-cycle /RD can occur.  Do not clear it here: doing so after the
+       physical /RD edge would erase the very hardware gate we need. */
     pio_sm_put(s_drive_pio, s_drive_sm, drive_word(v));
     s_pio_queued++;
-    s_driving=true;
+    s_preload_live=true;
     return true;
 }
 
@@ -127,7 +142,13 @@ static void clear_state(void){
     s_echo_target=s_echo_match=s_echo_bad=0; s_auto_disarm=s_budget_cut=0;
     s_active_passes=s_active_target=s_active_echo_bad=0; s_active_last_err=0xffffu;
     s_pio_queued=s_pio_fifo_full=s_pio_stale=0;
+    s_preload_seen=s_preload_cancel=s_preload_addr_change=0;
+    s_preload_no_rd=s_preload_miss=s_preload_unstable=0;
+    s_post_ok=s_post_bad=s_post_addr_mismatch=0; s_preload_live=false;
     s_gate_romsel=s_gate_wramsel=s_gate_ctrl=0;
+    s_romsel_pre_high=s_romsel_pre_low=0;
+    s_romsel_rd_high=s_romsel_rd_low=0;
+    s_drive_during_rom=0;
     s_drive_budget=0; s_arm_wait_pass=false;
     s_sample_last_off=0; s_sample_last_got=s_sample_last_exp=0; s_expected_off=0x6000u;
     s_last_off=0; s_last_data=0;
@@ -184,19 +205,25 @@ void cx4bus_reset_state(void){ s_reset_requested=true; }
 
 static void __not_in_flash_func(core1_loop)(void){
     /*
-     * v1.0.4: RD-LATCHED ADDRESS + PIO-owned OE.
+     * v1.0.6: PRELOAD + RD + ROMSEL-HARDWARE-GATE.
      *
-     * v1.0.3 proved the "early PHI2" address was not necessarily the address
-     * belonging to the later /RD assertion: almost every apparent target read
-     * was rejected because /ROMSEL belonged to a different cycle.
+     * v1.0.4 proved that the authoritative address must be sampled in the
+     * actual /RD window.  Its remaining failure was latency: Core1 only queued
+     * the byte AFTER /RD, leaving too little setup time on D0-D7.
      *
-     * While a one-pass test is armed, wait for /RD inside each PHI2-high
-     * window, THEN sample A0-A23 twice.  Only a stable, identical pair that
-     * decodes exactly to $00:6000-$6BFF is eligible to drive.  /WR and
-     * /WRAMSEL remain hard safety gates. /ROMSEL is recorded as a diagnostic
-     * only: the exact double-sampled address is the authoritative decode for
-     * this otherwise-unmapped test range. SM2 still owns the actual OE timing
-     * and releases D0-D7 at PHI2 falling edge.
+     * v1.0.6 uses a two-stage qualification:
+     *   1) PRE-RD candidate: while PHI2 is high and /RD is still high, watch
+     *      for a stable $00:6000-$6BFF address with /WR and /WRAMSEL inactive.
+     *      Queue the expected byte into PIO0 SM2, but keep DATA pins inputs.
+     *   2) HARDWARE GATE: PIO2 sees physical /RD and checks physical /ROMSEL.
+     *      It raises PIO0 IRQ2 ONLY when /ROMSEL is HIGH. SM2 is already waiting
+     *      with the byte in OSR, so it can place data and assert OE deterministically.
+     *      Genuine ROM reads (/ROMSEL LOW) never receive the drive IRQ.
+     *
+     * After /RD, Core1 repeats the exact v1.0.4 double address sample and
+     * control checks.  That post-RD sample remains authoritative for stats and
+     * safety.  If it disagrees with the preloaded candidate, DATA is released
+     * immediately and the mismatch is counted.
      */
     s_core1_started=true;
     data_release();
@@ -211,50 +238,173 @@ static void __not_in_flash_func(core1_loop)(void){
         prev_phi=true;
         s_phi_cycles++;
 
-        /* When disarmed, never inspect/drive the data bus; just finish cycle. */
         if(!(s_arm_request && s_magic)){
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
 
-        /* Wait for the actual A-bus read strobe in THIS PHI2-high window. */
-        bool saw_rd = ((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u);
-        while(!saw_rd && ((sio_hw->gpio_in & PHI2_MASK) != 0u)){
-            saw_rd = ((sio_hw->gpio_hi_in & RD_HI_MASK) == 0u);
+        /* Remove an IRQ2 left behind by an unrelated read from an earlier
+           cycle.  This happens before current-cycle predecode, avoiding the
+           clear-vs-/RD race that would exist inside queue_drive(). */
+        if(s_drive_ready) pio_interrupt_clear(s_drive_pio, 2);
+
+        bool preloaded=false;
+        bool abandon_cycle=false;
+        uint32_t pre_addr=0;
+        uint8_t pre_value=0;
+
+        /* Find a target address BEFORE /RD.  Unlike v1.0.3, we do not assume
+           the address at PHI2 rising belongs to the later read.  We keep
+           watching the live bus until either a stable target appears or /RD
+           itself arrives. */
+        while((sio_hw->gpio_in & PHI2_MASK) != 0u){
+            uint32_t hi_now=sio_hw->gpio_hi_in;
+            if((hi_now & RD_HI_MASK)==0u) break;
+
+            uint32_t lo1=sio_hw->gpio_in;
+            uint32_t hi1=sio_hw->gpio_hi_in;
+            if((lo1 & PHI2_MASK)==0u) break;
+
+            /* Writes, WRAM cycles and genuine ROM cycles are never eligible. */
+            if((lo1 & WR_MASK)==0u || (hi1 & WRAMSEL_HI_MASK)==0u){
+                tight_loop_contents();
+                continue;
+            }
+            if((hi1 & ROMSEL_HI_MASK)==0u){
+                s_romsel_pre_low++;
+                tight_loop_contents();
+                continue;
+            }
+
+            uint32_t a1=raw_address24(lo1,hi1);
+            if(!safe_test_read(a1)){
+                tight_loop_contents();
+                continue;
+            }
+
+            __asm volatile("nop\n nop\n");
+            if((sio_hw->gpio_in & PHI2_MASK)==0u) break;
+            if((sio_hw->gpio_hi_in & RD_HI_MASK)==0u) break;
+
+            uint32_t lo2=sio_hw->gpio_in;
+            uint32_t hi2=sio_hw->gpio_hi_in;
+            uint32_t a2=raw_address24(lo2,hi2);
+            if(a1!=a2){
+                s_preload_unstable++;
+                continue;
+            }
+            if((lo2 & WR_MASK)==0u || (hi2 & WRAMSEL_HI_MASK)==0u) continue;
+            if((hi2 & ROMSEL_HI_MASK)==0u){
+                s_romsel_pre_low++;
+                continue;
+            }
+            s_romsel_pre_high++;
+
+            if(s_drive_budget==0u){
+                s_budget_cut++;
+                s_arm_request=false;
+                data_release();
+                abandon_cycle=true;
+                break;
+            }
+
+            /* Final pre-queue strobe check.  If /RD arrived during the few
+               instructions above, do not publish a late word; let the post-RD
+               path record a clean preload miss instead. */
+            if((sio_hw->gpio_hi_in & RD_HI_MASK)==0u) break;
+
+            pre_addr=a2;
+            pre_value=expected_data((uint16_t)a2);
+            if(!queue_drive(pre_value)){
+                abandon_cycle=true;
+                break;
+            }
+            preloaded=true;
+            s_preload_seen++;
+            s_last_off=(uint16_t)pre_addr;
+            s_last_data=pre_value;
+
+            /* A preloaded word is valid only while THIS address/control tuple
+               remains present.  If it changes before /RD, cancel the PIO word
+               rather than letting a future unrelated /RD consume it. */
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u){
+                uint32_t hiw=sio_hw->gpio_hi_in;
+                if((hiw & RD_HI_MASK)==0u) break;
+                uint32_t low=sio_hw->gpio_in;
+                uint32_t high=sio_hw->gpio_hi_in;
+                if((low & WR_MASK)==0u || (high & WRAMSEL_HI_MASK)==0u ||
+                   (high & ROMSEL_HI_MASK)==0u ||
+                   raw_address24(low,high)!=pre_addr){
+                    s_preload_cancel++;
+                    s_preload_addr_change++;
+                    s_pio_stale++;
+                    data_release();
+                    preloaded=false;
+                    abandon_cycle=true;
+                    break;
+                }
+            }
+            break;
         }
-        if(!saw_rd){
-            s_phi_no_rd++;
+
+        if(abandon_cycle){
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
+
+        /* If PHI2 ended before /RD, the queued word must not survive into the
+           next bus cycle. */
+        if((sio_hw->gpio_in & PHI2_MASK)==0u){
+            s_phi_no_rd++;
+            if(preloaded){
+                s_preload_no_rd++;
+                s_preload_cancel++;
+                s_pio_stale++;
+                data_release();
+            }
+            prev_phi=false;
+            continue;
+        }
+
+        /* /RD is now active.  If we preloaded successfully, PIO2 has already
+           raised IRQ2 and SM2 is enabling DATA in hardware while Core1 performs
+           the authoritative v1.0.4 post-RD validation below. */
         s_rd_edges++;
         s_phi_rd++;
-
-        /* Latch address only AFTER /RD is asserted. Double sample it to reject
-           transition/metastable observations before any output-enable request. */
-        __asm volatile("nop\n nop\n");
-        if((sio_hw->gpio_in & PHI2_MASK)==0u){
-            s_too_late++;
-            prev_phi=false;
-            continue;
+        if(preloaded){
+            s_driving=true;
+            s_driven++;
+            s_drive_budget--;
         }
-        uint32_t lo1=sio_hw->gpio_in;
-        uint32_t hi1=sio_hw->gpio_hi_in;
-        uint32_t a1=raw_address24(lo1,hi1);
 
         __asm volatile("nop\n nop\n");
         if((sio_hw->gpio_in & PHI2_MASK)==0u){
             s_too_late++;
+            if(preloaded){ s_post_bad++; data_release(); }
             prev_phi=false;
             continue;
         }
-        uint32_t lo2=sio_hw->gpio_in;
-        uint32_t hi2=sio_hw->gpio_hi_in;
-        uint32_t a2=raw_address24(lo2,hi2);
+        uint32_t rd_lo1=sio_hw->gpio_in;
+        uint32_t rd_hi1=sio_hw->gpio_hi_in;
+        uint32_t a1=raw_address24(rd_lo1,rd_hi1);
+
+        __asm volatile("nop\n nop\n");
+        if((sio_hw->gpio_in & PHI2_MASK)==0u){
+            s_too_late++;
+            if(preloaded){ s_post_bad++; data_release(); }
+            prev_phi=false;
+            continue;
+        }
+        uint32_t rd_lo2=sio_hw->gpio_in;
+        uint32_t rd_hi2=sio_hw->gpio_hi_in;
+        uint32_t a2=raw_address24(rd_lo2,rd_hi2);
         s_addr_double++;
+
         if(a1!=a2){
             s_addr_unstable++;
+            if(preloaded){ s_post_bad++; data_release(); }
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
@@ -265,12 +415,14 @@ static void __not_in_flash_func(core1_loop)(void){
         bool range_ok=(off>=0x6000u && off<=0x6bffu);
         if(!bank_ok){
             s_rd_bank_miss++;
+            if(preloaded){ s_post_bad++; data_release(); }
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
         if(!range_ok){
             s_rd_range_miss++;
+            if(preloaded){ s_post_bad++; data_release(); }
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
@@ -278,62 +430,86 @@ static void __not_in_flash_func(core1_loop)(void){
         s_phi_target++;
         s_phi_target_rd++;
 
-        /* Control lines sampled in the same RD-qualified window. */
         uint32_t lo_ctrl=sio_hw->gpio_in;
         uint32_t hi_ctrl=sio_hw->gpio_hi_in;
         if((lo_ctrl & PHI2_MASK)==0u){
             s_too_late++;
+            if(preloaded){ s_post_bad++; data_release(); }
             prev_phi=false;
             continue;
         }
         if((lo_ctrl & WR_MASK)==0u){
             s_gate_ctrl++;
+            if(preloaded){ s_post_bad++; data_release(); }
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
         if((hi_ctrl & WRAMSEL_HI_MASK)==0u){
             s_gate_wramsel++;
+            if(preloaded){ s_post_bad++; data_release(); }
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
-        /* $00:6000-$6BFF normally has /ROMSEL deasserted. Count an asserted
-           observation, but do not let a possibly skewed auxiliary select line
-           veto an address that was stable twice during the actual /RD window. */
-        if((hi_ctrl & ROMSEL_HI_MASK)==0u) s_gate_romsel++;
+        if((hi_ctrl & ROMSEL_HI_MASK)==0u){
+            s_gate_romsel++;
+            s_romsel_rd_low++;
+            /* PIO2 should have suppressed IRQ2, so this must never have driven.
+               If software believed it had preloaded/driven, record the hazard and
+               force the pins back to input immediately. */
+            if(preloaded){
+                s_drive_during_rom++;
+                s_post_bad++;
+                data_release();
+            }
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
+        s_romsel_rd_high++;
 
-        if(s_drive_budget==0u){
-            s_budget_cut++;
-            s_arm_request=false;
+        /* A target read that reached /RD without a preload is intentionally NOT
+           driven.  This is safer than falling back to the late v1.0.4 path and
+           gives us a clean preload_miss counter for timing diagnosis. */
+        if(!preloaded){
+            s_preload_miss++;
+            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+            prev_phi=false;
+            continue;
+        }
+
+        if(a2!=pre_addr){
+            s_post_addr_mismatch++;
+            s_post_bad++;
             data_release();
             while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
             prev_phi=false;
             continue;
         }
 
-        uint8_t v=expected_data(off);
-        if(!queue_drive(v)){
-            while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
-            prev_phi=false;
-            continue;
-        }
-        s_cpu_r++; s_rd_safe++; s_active_target++;
-        s_last_off=off; s_last_data=v;
-        s_driven++; s_drive_budget--;
+        s_post_ok++;
+        s_cpu_r++;
+        s_rd_safe++;
+        s_active_target++;
+        s_last_off=off;
+        s_last_data=pre_value;
 
-        /* Immediate pad echo is diagnostic only; SM2 owns OE release. */
-        __asm volatile("nop\n nop\n nop\n nop\n");
+        /* By the time the post-RD double sample finishes, SM2 should already be
+           driving.  This echo is now a useful direct measure of the hardware
+           gate rather than of Core1->PIO queue latency. */
+        __asm volatile("nop\n nop\n");
         if((sio_hw->gpio_in & PHI2_MASK)!=0u){
             uint8_t echo=raw_data(sio_hw->gpio_in);
             s_echo_target++;
-            if(echo==v) s_echo_match++;
+            if(echo==pre_value) s_echo_match++;
             else { s_echo_bad++; s_active_echo_bad++; }
         }else{
             s_pio_stale++;
         }
 
         while((sio_hw->gpio_in & PHI2_MASK) != 0u) tight_loop_contents();
+        s_preload_live=false;
         s_driving=false;
         s_fixed_hold++;
         prev_phi=false;
@@ -371,7 +547,8 @@ static void mailbox(uint16_t off,uint8_t data){
     if(data==0x10u){
         s_phase=0x10u; s_write_seen=s_write_bad_data=s_write_bad_addr=0; s_expected_off=0x6000u; s_read_errors=0xffffu;
     }else if(data==0x20u){
-        if(s_phase==0x10u)finish_write_phase(); s_phase=0x20u; s_reg_index=0; s_reg_bad=0;
+        if(s_phase==0x10u) finish_write_phase();
+        s_phase=0x20u; s_reg_index=0; s_reg_bad=0;
     }else if(data==0x30u){
         s_phase=0x30u;
         if(s_reg_index==6u && s_reg_bad==0u)s_reg_passes++;
@@ -470,15 +647,22 @@ void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=
 void cx4bus_print_runs(void){ printf("BUSREG seq=%u index=%lu bad=%lu expected=7F49:00 7F4A:80 7F4B:02 7F4D:0E 7F4E:00 7F4F:5C\n",s_seq,(unsigned long)s_reg_index,(unsigned long)s_reg_bad); }
 void cx4bus_selfcheck(void){ printf("BUSTEST ROM expected: test_rom/CX4_BUS_TEST.sfc (no injected game ROM required)\n"); }
 void cx4bus_print_status(void){
-    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.4_RD_LATCH_PIO_OE arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
+    bool ready = (s_active_passes > 0u) && (s_active_last_err == 0u) &&
+                 (s_active_echo_bad == 0u) && (s_drive_during_rom == 0u) &&
+                 (s_post_bad == 0u);
+    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.6_ROMSEL_HW_GATE verdict=%s arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
            "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu bad_data_total=%llu bad_addr_total=%llu missing_total=%llu extra_total=%llu "
            "reg_passes=%llu reg_index=%lu reg_bad=%lu read_passes=%llu cur_err=%u last_err=%u read_good=%llu read_bad=%llu "
            "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu phi_target=%llu phi_rd=%llu phi_target_rd=%llu phi_no_rd=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu "
            "addr2=%llu unstable=%llu too_late=%llu cpu_r=%llu driven=%llu budget=%lu budget_cut=%llu auto_disarm=%llu edge_release=%llu "
            "active_passes=%llu active_last_err=%u active_target=%llu active_echo_bad=%llu "
-           "pio_ready=%u pio_q=%llu pio_full=%llu pio_stale=%llu gate_rom=%llu gate_wram=%llu gate_ctrl=%llu "
+           "pio_ready=%u pio_q=%llu pio_full=%llu pio_stale=%llu "
+           "pre_live=%u pre=%llu pre_cancel=%llu pre_addrchg=%llu pre_no_rd=%llu pre_miss=%llu pre_unstable=%llu "
+           "post_ok=%llu post_bad=%llu post_addr_mismatch=%llu gate_rom=%llu gate_wram=%llu gate_ctrl=%llu "
+           "romsel_pre=%llu/%llu romsel_rd=%llu/%llu drive_during_rom=%llu "
            "echo=%llu/%llu bad=%llu sample=%llu/%llu bad=%llu sample_last=%04X:%02X/%02X "
            "first_bad=%04lX/%04lX:%02X/%02X last=%04X:%02X\n",
+           ready?"READY_FOR_GAME":"NOT_YET",
            s_arm_request?1u:0u,s_arm_pending?1u:0u,(s_arm_request&&s_magic)?1u:0u,s_driving?"ON":"OFF",s_magic?1u:0u,s_seq,s_phase,
            (unsigned long long)s_passes,(unsigned long long)s_write_passes,(unsigned long)s_write_seen,
            (unsigned long)s_write_bad_data,(unsigned long)s_write_bad_addr,(unsigned long)s_write_count_bad,
@@ -497,7 +681,14 @@ void cx4bus_print_status(void){
            (unsigned long long)s_budget_cut,(unsigned long long)s_auto_disarm,(unsigned long long)s_fixed_hold,
            (unsigned long long)s_active_passes,(unsigned)s_active_last_err,(unsigned long long)s_active_target,(unsigned long long)s_active_echo_bad,
            s_drive_ready?1u:0u,(unsigned long long)s_pio_queued,(unsigned long long)s_pio_fifo_full,(unsigned long long)s_pio_stale,
+           s_preload_live?1u:0u,(unsigned long long)s_preload_seen,(unsigned long long)s_preload_cancel,
+           (unsigned long long)s_preload_addr_change,(unsigned long long)s_preload_no_rd,
+           (unsigned long long)s_preload_miss,(unsigned long long)s_preload_unstable,
+           (unsigned long long)s_post_ok,(unsigned long long)s_post_bad,(unsigned long long)s_post_addr_mismatch,
            (unsigned long long)s_gate_romsel,(unsigned long long)s_gate_wramsel,(unsigned long long)s_gate_ctrl,
+           (unsigned long long)s_romsel_pre_high,(unsigned long long)s_romsel_pre_low,
+           (unsigned long long)s_romsel_rd_high,(unsigned long long)s_romsel_rd_low,
+           (unsigned long long)s_drive_during_rom,
            (unsigned long long)s_echo_match,(unsigned long long)s_echo_target,(unsigned long long)s_echo_bad,
            (unsigned long long)s_sample_match,(unsigned long long)s_sample_target,(unsigned long long)s_sample_bad,
            s_sample_last_off,s_sample_last_got,s_sample_last_exp,

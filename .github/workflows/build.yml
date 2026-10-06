@@ -1,4 +1,4 @@
-name: Build ROMSEL ANALYZER v1.1 PASSIVE
+name: Build BUS VALIDATOR v1.0.6 ROMSEL HW-GATE
 on:
   workflow_dispatch:
   push:
@@ -23,8 +23,8 @@ jobs:
         run: cmake -S . -B build -G Ninja
       - name: Build
         run: cmake --build build
-      - run: cp build/snes_rp2350b_romsel_analyzer.uf2 build/ROMSEL_ANALYZER_v1.1_PASSIVE.uf2
+      - run: cp build/snes_rp2350b_bus_validator.uf2 build/BUS_VALIDATOR_v1.0.6_ROMSEL_HW_GATE.uf2
       - uses: actions/upload-artifact@v4
         with:
-          name: romsel-analyzer-v1.1-passive
-          path: build/ROMSEL_ANALYZER_v1.1_PASSIVE.uf2
+          name: bus-validator-v1.0.6-romsel-hw-gate
+          path: build/BUS_VALIDATOR_v1.0.6_ROMSEL_HW_GATE.uf2

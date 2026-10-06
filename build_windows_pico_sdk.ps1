@@ -6,4 +6,4 @@ if (-not $env:PICO_SDK_PATH) {
 cmake -S . -B build -G Ninja
 cmake --build build
 Write-Host ""
-Write-Host "UF2 gerado em: build\snes_rp2350b_romsel_analyzer.uf2"
+Write-Host "UF2 gerado em: build\snes_rp2350b_capture.uf2"

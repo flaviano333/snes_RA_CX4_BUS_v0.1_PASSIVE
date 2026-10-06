@@ -16,6 +16,7 @@
 #include "capture_read_trigger.pio.h"
 #include "capture_read_low.pio.h"
 #include "capture_read_high.pio.h"
+#include "cx4_active_bus.h"
 
 #define PIN_PHI2       0
 #define PIN_WR         1
@@ -24,23 +25,6 @@
 #define PIN_RD         35
 #define PIN_ROMSEL     38   // reserved/passive in v1.6O3
 #define PIN_WRAMSEL    39   // active-low WRAM select, used by v1.8
-
-// v1.1 ROMSEL PASSIVE ANALYZER. This firmware never drives D0-D7.
-typedef struct {
-    uint64_t r_total, r_romsel_low, r_romsel_high;
-    uint64_t w_total, w_romsel_low, w_romsel_high;
-} romsel_zone_t;
-
-static romsel_zone_t rs_6000;   // $00:6000-$6BFF (CX4 RAM window)
-static romsel_zone_t rs_7f40;   // $00:7F40-$7FAF (CX4 registers)
-static romsel_zone_t rs_rom;    // $00:8000-$FFFF (LoROM ROM window)
-static uint64_t rs_all_r = 0, rs_all_w = 0;
-static uint64_t rs_all_r_low = 0, rs_all_r_high = 0;
-static uint64_t rs_all_w_low = 0, rs_all_w_high = 0;
-static uint32_t rs_last_addr = 0;
-static uint8_t rs_last_data = 0;
-static bool rs_last_read = false;
-static bool rs_last_romsel_low = false;
 
 #define SAMPLE_COUNT   1024
 #define WRAM_SIZE      (128u * 1024u)
@@ -206,70 +190,6 @@ static inline bool sampled_wramsel_active(uint32_t high20) {
     return ((high20 >> (PIN_WRAMSEL - PIN_HIGH_BASE)) & 1u) == 0u;
 }
 
-static inline bool sampled_romsel_active(uint32_t high20) {
-    // HIGH window starts at GP21, therefore GP38 is bit 17.
-    // /ROMSEL is active low.
-    return ((high20 >> (PIN_ROMSEL - PIN_HIGH_BASE)) & 1u) == 0u;
-}
-
-static romsel_zone_t *romsel_zone_for(uint32_t address) {
-    if (address >= 0x006000u && address <= 0x006bffu) return &rs_6000;
-    if (address >= 0x007f40u && address <= 0x007fafu) return &rs_7f40;
-    if (address >= 0x008000u && address <= 0x00ffffu) return &rs_rom;
-    return NULL;
-}
-
-static void romsel_observe(bool is_read, uint32_t address, uint8_t data, uint32_t high20) {
-    bool low = sampled_romsel_active(high20);
-    rs_last_addr = address;
-    rs_last_data = data;
-    rs_last_read = is_read;
-    rs_last_romsel_low = low;
-    if (is_read) {
-        ++rs_all_r;
-        if (low) ++rs_all_r_low; else ++rs_all_r_high;
-    } else {
-        ++rs_all_w;
-        if (low) ++rs_all_w_low; else ++rs_all_w_high;
-    }
-    romsel_zone_t *z = romsel_zone_for(address);
-    if (!z) return;
-    if (is_read) {
-        ++z->r_total;
-        if (low) ++z->r_romsel_low; else ++z->r_romsel_high;
-    } else {
-        ++z->w_total;
-        if (low) ++z->w_romsel_low; else ++z->w_romsel_high;
-    }
-}
-
-static void command_romstat(void) {
-    printf("ROMSTAT mode=ROMSEL_PASSIVE_V1.1 drive=IMPOSSIBLE "
-           "6000_r=%llu/low=%llu/high=%llu 6000_w=%llu/low=%llu/high=%llu "
-           "7F40_r=%llu/low=%llu/high=%llu 7F40_w=%llu/low=%llu/high=%llu "
-           "ROM_r=%llu/low=%llu/high=%llu ROM_w=%llu/low=%llu/high=%llu "
-           "all_r=%llu/low=%llu/high=%llu all_w=%llu/low=%llu/high=%llu "
-           "last=%c:%06lX:%02X romsel=%u\n",
-           (unsigned long long)rs_6000.r_total, (unsigned long long)rs_6000.r_romsel_low, (unsigned long long)rs_6000.r_romsel_high,
-           (unsigned long long)rs_6000.w_total, (unsigned long long)rs_6000.w_romsel_low, (unsigned long long)rs_6000.w_romsel_high,
-           (unsigned long long)rs_7f40.r_total, (unsigned long long)rs_7f40.r_romsel_low, (unsigned long long)rs_7f40.r_romsel_high,
-           (unsigned long long)rs_7f40.w_total, (unsigned long long)rs_7f40.w_romsel_low, (unsigned long long)rs_7f40.w_romsel_high,
-           (unsigned long long)rs_rom.r_total, (unsigned long long)rs_rom.r_romsel_low, (unsigned long long)rs_rom.r_romsel_high,
-           (unsigned long long)rs_rom.w_total, (unsigned long long)rs_rom.w_romsel_low, (unsigned long long)rs_rom.w_romsel_high,
-           (unsigned long long)rs_all_r, (unsigned long long)rs_all_r_low, (unsigned long long)rs_all_r_high,
-           (unsigned long long)rs_all_w, (unsigned long long)rs_all_w_low, (unsigned long long)rs_all_w_high,
-           rs_last_read ? 'R' : 'W', (unsigned long)rs_last_addr, rs_last_data, rs_last_romsel_low ? 0u : 1u);
-}
-
-static void command_romreset(void) {
-    memset(&rs_6000, 0, sizeof(rs_6000));
-    memset(&rs_7f40, 0, sizeof(rs_7f40));
-    memset(&rs_rom, 0, sizeof(rs_rom));
-    rs_all_r = rs_all_w = rs_all_r_low = rs_all_r_high = rs_all_w_low = rs_all_w_high = 0;
-    rs_last_addr = 0; rs_last_data = 0; rs_last_read = false; rs_last_romsel_low = false;
-    printf("OK passive /ROMSEL counters cleared\n");
-}
-
 static inline uint32_t sampled_gpio_bit(uint32_t low18, uint32_t high20, uint gpio) {
     // low18 bit0 is GP2 and bit17 is GP19.
     if (gpio >= 11 && gpio <= 19) {
@@ -399,7 +319,7 @@ static void cx4_feed_pio_write_prefix(uint buf) {
         uint32_t high20 = unpack_high20(high_samples[buf][i]);
         uint8_t data = reconstruct_data(low18);
         uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
-        (void)address; (void)data;
+        cx4bus_pio_write(address, data);
         cx4_pio_write_scan_total++;
     }
     cx4_pio_write_scan_pos[buf] = count;
@@ -811,9 +731,13 @@ static void print_help(void) {
     printf("  WMSTATE                 show $2180-$2183 pointer/counters\n");
     printf("  WRAMSEL                 show v2.0 /WRAMSEL + READ-REPAIR counters\n");
     printf("  CHEESE                  show $1558/$155C values and targeted counters\n");
-    printf("  ROMSTAT / BUSSTAT       passive /ROMSEL statistics for CX4 and ROM windows\n");
-    printf("  ROMRESET / BUSRESET     clear passive /ROMSEL counters\n");
-    printf("  BUSARM                  unavailable: this build has no D0-D7 output path\n");
+    printf("  BUSSTAT                 show deterministic bus-test counters\n");
+    printf("  BUSTRACE                show last bus-test access/phase\n");
+    printf("  BUSREG                  show register-sequence validation\n");
+    printf("  BUSTEST                 show expected test ROM name\n");
+    printf("  BUSARM                  enable readback ONLY for BUS6 test ROM $00:6000-$6BFF\n");
+    printf("  BUSDISARM               disable active response; D0-D7 immediately INPUT\n");
+    printf("  BUSRESET                clear validator state without changing arm request\n");
     printf("  PING                    reply PONG\n");
     printf("Mirror source: /WRAMSEL-qualified writes + qualified A-bus READ-REPAIR + conservative WMDATA ($2180).\n");
     printf("DEBUG is diagnostic only: use it in PuTTY with the Python RA bridge closed.\n");
@@ -1174,14 +1098,23 @@ static void execute_command(char *line) {
         command_wramsel();
     } else if (!strcmp(cmd, "CHEESE")) {
         command_cheese();
-    } else if (!strcmp(cmd, "ROMSTAT") || !strcmp(cmd, "BUSSTAT")) {
-        command_romstat();
-    } else if (!strcmp(cmd, "ROMRESET") || !strcmp(cmd, "BUSRESET")) {
-        command_romreset();
+    } else if (!strcmp(cmd, "BUSSTAT")) {
+        cx4bus_print_status();
+    } else if (!strcmp(cmd, "BUSTRACE")) {
+        cx4bus_print_trace();
+    } else if (!strcmp(cmd, "BUSREG")) {
+        cx4bus_print_runs();
+    } else if (!strcmp(cmd, "BUSTEST")) {
+        cx4bus_selfcheck();
     } else if (!strcmp(cmd, "BUSARM")) {
-        printf("ERR PASSIVE-ONLY firmware: D0-D7 output path is not compiled in.\n");
+        cx4bus_arm(true);
+        printf("OK BUS one-pass queued. It will pre-arm at the END of the current pass, then validate the NEXT complete READ pass.\n");
     } else if (!strcmp(cmd, "BUSDISARM")) {
-        printf("OK already passive; D0-D7 are GPIO inputs only.\n");
+        cx4bus_arm(false);
+        printf("OK BUS readback disabled; D0-D7 released to INPUT.\n");
+    } else if (!strcmp(cmd, "BUSRESET")) {
+        cx4bus_reset_state();
+        printf("OK BUS validator state reset.\n");
     } else {
         printf("ERR unknown command '%s' (type HELP)\n", cmd);
     }
@@ -1221,7 +1154,6 @@ static void process_write_batch(const uint32_t *low_buf, const uint32_t *high_bu
         uint32_t high20 = unpack_high20(high_buf[i]);
         uint8_t data = reconstruct_data(low18);
         uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
-        romsel_observe(false, address, data, high20);
         cx4_observe_write(address, data);
         uint8_t bank = (uint8_t)(address >> 16);
 
@@ -1263,7 +1195,7 @@ static void process_read_batch(const uint32_t *low_buf, const uint32_t *high_buf
         uint32_t high20 = unpack_high20(high_buf[i]);
         uint8_t data = reconstruct_data(low18);
         uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
-        romsel_observe(true, address, data, high20);
+        cx4bus_pio_read(address, data);
         cx4_observe_read(address, data);
         uint8_t bank = (uint8_t)(address >> 16);
 
@@ -1316,14 +1248,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + ROMSEL ANALYZER v1.1 PASSIVE ===\n");
+    printf("\n=== SNES RP2350B RA + BUS VALIDATOR v1.0.6 ROMSEL-HW-GATE ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
     printf("A11..A13=GP23..25; GP26=SKIP; A14..A21=GP27..34; /RD=GP35.\n");
     printf("A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39.\n");
     printf("GP39=/WRAMSEL is ACTIVE in v2.0; GP40 remains A10.\n");
-    printf("Type HELP for commands. PASSIVE-ONLY: this firmware has no D0-D7 output path.\n\n");
+    printf("Type HELP for commands. BUS readback starts DISARMED and is gated by the BUS6 test ROM magic.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 40; ++pin) {
@@ -1368,7 +1300,7 @@ int main(void) {
     sm_config_set_fifo_join(&c_hi, PIO_FIFO_JOIN_RX);
     int init_hi_rc = pio_sm_init(pio_hi, sm_hi, off_hi, &c_hi);
 
-    // ---------- PIO2: /RD detector ----------
+    // ---------- PIO2: /RD detector + /ROMSEL hardware gate ----------
     PIO pio_rd = pio2;
     const uint sm_rd_trigger = 0;
     int base_rd_rc = pio_set_gpio_base(pio_rd, 16);
@@ -1376,6 +1308,9 @@ int main(void) {
     pio_sm_set_consecutive_pindirs(pio_rd, sm_rd_trigger, PIN_RD, 1, false);
     uint off_rd_trigger = pio_add_program(pio_rd, &snes_read_trigger_program);
     pio_sm_config c_rd_trigger = snes_read_trigger_program_get_default_config(off_rd_trigger);
+    // RP2350B + PICO_PIO_USE_GPIO_BASE=1: sm_config pin APIs take real GPIO numbers.
+    // PIO2 base is 16, so physical GP38 is valid here and becomes JMP PIN index 22.
+    sm_config_set_jmp_pin(&c_rd_trigger, PIN_ROMSEL);
     int init_rd_trigger_rc = pio_sm_init(pio_rd, sm_rd_trigger, off_rd_trigger, &c_rd_trigger);
 
     // ---------- PIO0 SM1: GP2..GP19 low window on reads ----------
@@ -1408,6 +1343,10 @@ int main(void) {
             sleep_ms(10);
         }
     }
+
+    // BUS validator: PIO0 SM2 owns D0-D7 output-enable timing; capture SMs still
+    // observe the same pad inputs. No CX4 emulation runs in this firmware.
+    cx4bus_init();
 
     int dma_lo = dma_claim_unused_channel(true);
     int dma_hi = dma_claim_unused_channel(true);
@@ -1449,7 +1388,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; ROMSEL ANALYZER v1.1 PASSIVE available; D0-D7 are INPUT only.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; BUS VALIDATOR v1.0.6 ROMSEL-HW-GATE available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
@@ -1488,12 +1427,18 @@ int main(void) {
     pio_sm_set_enabled(pio_lo, sm_read_lo, true);
     pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
 
+    // Dedicated core1 handles the latency-critical active CX4 cartridge interface.
+    // It starts with response disabled; CX4ARM is required before any data pin drives.
+    cx4bus_launch_core1();
+
     uint write_buf = 0;
     uint read_buf = 0;
 
     while (true) {
         // v0.4: PIO+DMA is authoritative for CX4 writes. Feed every newly
         // completed address/data pair before advancing the LLE core.
+        cx4_feed_pio_write_prefix(write_buf);
+        cx4bus_service();
 
         // v1.6: when a pair fills, switch DMA to the other buffer immediately.
         // PIO remains enabled, so its FIFO only has to cover the few register writes
@@ -1504,6 +1449,7 @@ int main(void) {
             uint next = done ^ 1u;
 
             // Consume the tail that may have arrived since the loop-top scan.
+            cx4_feed_pio_write_prefix(done);
 
             // Rearm first. Do not stop/restart/clear the PIO state machines.
             dma_channel_set_write_addr(dma_lo, low_samples[next], false);
@@ -1516,8 +1462,10 @@ int main(void) {
             cx4_pio_write_scan_pos[next] = 0;
 
             // Service CX4 before/after the comparatively heavy RA mirror decode.
-                process_write_batch(low_samples[done], high_samples[done]);
-            }
+            cx4bus_service();
+            process_write_batch(low_samples[done], high_samples[done]);
+            cx4bus_service();
+        }
 
         if (dma_remaining(dma_read_lo) == 0 && dma_remaining(dma_read_hi) == 0) {
             uint done = read_buf;
@@ -1531,9 +1479,12 @@ int main(void) {
             read_buf = next;
             cx4_active_read_buf = next;
 
-                process_read_batch(read_low_samples[done], read_high_samples[done]);
-            }
+            cx4bus_service();
+            process_read_batch(read_low_samples[done], read_high_samples[done]);
+            cx4bus_service();
+        }
 
+        cx4bus_service();
         poll_serial_commands();
 
         tight_loop_contents();

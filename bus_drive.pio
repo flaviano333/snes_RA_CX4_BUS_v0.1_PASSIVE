@@ -10,23 +10,26 @@
 ;   bits 0..8   = output levels for GP2..GP10
 ;   bits 9..17  = output-enable mask (normally 0x1FF)
 ;
-; Core1 only queues a word after strict address/control gating. PIO owns the
-; critical output-enable timing. If PHI2 has already fallen, the word is
-; discarded without ever enabling the pins. Once enabled, OE is removed a
-; deterministic two PIO clocks after PHI2 falls.
+; v1.0.6 PRELOAD + RD + ROMSEL-HARDWARE-GATE:
+; Core1 queues the already-computed data word BEFORE /RD. PIO2 raises
+; PIO0 IRQ2 at the physical /RD falling edge ONLY when /ROMSEL is HIGH,
+; so genuine ROM reads can never open the D0-D7 output gate. PHI2 remains
+; lifetime gate: if the event arrives after PHI2 fell, OE never turns on;
+; once enabled, OE is removed deterministically after PHI2 falls.
 
 .wrap_target
 loop:
     pull block
-    jmp pin phi_ok_1
-    jmp loop
+    wait 1 irq 2           ; /RD event from PIO2; clears PIO0 IRQ2
+    jmp pin phi_ok_1       ; jmp pin = PHI2
+    jmp loop               ; stale/late event: discard word, keep OE off
 phi_ok_1:
-    out pins, 9
+    out pins, 9            ; put data levels on pads while still inputs
     jmp pin phi_ok_2
-    jmp loop
+    jmp loop               ; PHI2 vanished before OE: discard safely
 phi_ok_2:
-    out pindirs, 9
-    wait 0 gpio 0
+    out pindirs, 9         ; assert OE only after data is already present
+    wait 0 gpio 0          ; hold through the rest of PHI2 high
     mov osr, null
-    out pindirs, 9
+    out pindirs, 9         ; release GP2..GP10
 .wrap
