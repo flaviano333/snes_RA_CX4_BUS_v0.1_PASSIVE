@@ -9,7 +9,7 @@
 #include "bus_drive.pio.h"
 
 /*
- * v1.0.1 PIO-OE + SYNCHRONIZED ONE-PASS RESPONDER
+ * v1.0.2 PIO-OE + EARLY PREARM ONE-PASS RESPONDER
  *
  * This deliberately does NOT emulate CX4. It validates the electrical/data
  * path with a deterministic test ROM. PIO+DMA is authoritative for writes.
@@ -363,19 +363,17 @@ static void mailbox(uint16_t off,uint8_t data){
     }else if(data==0x30u){
         s_phase=0x30u;
         if(s_reg_index==6u && s_reg_bad==0u)s_reg_passes++;
-        if(s_arm_pending && s_arm_wait_pass){
-            /* Start exactly at the next full READ phase, never mid-pass. */
-            s_arm_pending=false;
-            s_arm_request=true;
-            s_drive_budget=4096u;
-            s_active_target=0;
-            s_active_echo_bad=0;
-        }
+        /* v1.0.2: DO NOT arm here.  This marker arrives through the
+           PIO+DMA write-capture path and can be processed after most of the
+           following read loop has already happened.  Arming here was why
+           v0.9.1/v1.0.1 only saw 19/0 target reads. */
     }else if(data==0x40u){
         s_phase=0x40u;
         s_last_read_errors=s_read_errors;
         if(s_last_read_errors==0u) s_read_pass_good++; else s_read_pass_bad++;
         s_read_passes++; s_passes++;
+
+        /* First close an active validation pass, if one was running. */
         if(s_arm_request && s_arm_wait_pass){
             s_active_last_err=s_read_errors;
             s_active_passes++;
@@ -384,6 +382,20 @@ static void mailbox(uint16_t off,uint8_t data){
             s_drive_budget=0;
             s_auto_disarm++;
             data_release();
+        }
+
+        /* A queued BUSARM begins HERE, at the end marker of the preceding
+           pass.  There is then an entire display delay + WRITE phase + REG
+           phase before the next READ phase starts, so core1 is already armed
+           long before the first $6000 read.  This deliberately compensates
+           for the latency of the PIO+DMA mailbox scanner. */
+        if(s_arm_pending){
+            s_arm_pending=false;
+            s_arm_request=true;
+            s_arm_wait_pass=true;
+            s_drive_budget=4096u;
+            s_active_target=0;
+            s_active_echo_bad=0;
         }
     }
 }
@@ -446,7 +458,7 @@ void cx4bus_print_trace(void){ printf("BUSTRACE last=%04X:%02X phase=%02X magic=
 void cx4bus_print_runs(void){ printf("BUSREG seq=%u index=%lu bad=%lu expected=7F49:00 7F4A:80 7F4B:02 7F4D:0E 7F4E:00 7F4F:5C\n",s_seq,(unsigned long)s_reg_index,(unsigned long)s_reg_bad); }
 void cx4bus_selfcheck(void){ printf("BUSTEST ROM expected: test_rom/CX4_BUS_TEST.sfc (no injected game ROM required)\n"); }
 void cx4bus_print_status(void){
-    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.1_PIO_OE arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
+    printf("BUSSTAT mode=BUS_VALIDATOR_V1.0.2_EARLY_PREARM arm=%u pending=%u gate=%u drive=%s magic=%u seq=%u phase=%02X passes=%llu "
            "write_passes=%llu write_seen=%lu bad_data=%lu bad_addr=%lu count_bad=%lu bad_data_total=%llu bad_addr_total=%llu missing_total=%llu extra_total=%llu "
            "reg_passes=%llu reg_index=%lu reg_bad=%lu read_passes=%llu cur_err=%u last_err=%u read_good=%llu read_bad=%llu "
            "magic_mask=%X magic_hits=%llu magic_bad=%llu pio_w=%llu phi=%llu rd_edges=%llu rd_safe=%llu rd_bank_miss=%llu rd_range_miss=%llu "
