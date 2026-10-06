@@ -11,7 +11,7 @@
 #include "cx4.h"
 
 /*
- * CX4 SYSCLK-ONLY HYBRID V6.2.1
+ * CX4 SYSCLK-ONLY HYBRID V6.2.2
  *
  * Goal: make the CPU-visible CX4 state deterministic for gameplay bring-up.
  * Runtime HG51B LLE is deliberately NOT connected to the CPU-visible C4RAM.
@@ -858,7 +858,7 @@ void cx4bus_print_status(void) {
     const uint32_t lle_runs = s_lle_core ? cx4_run_ring_count(s_lle_core) : 0u;
     const uint32_t lle_rdrom = s_lle_core ? cx4_rdrom_hits(s_lle_core) : 0u;
 
-    printf("CX4STAT mode=SYSCLK_ONLY_HYBRID_V6_2_1 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+    printf("CX4STAT mode=SYSCLK_ONLY_HYBRID_V6_2_2 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
            "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu "
            "lle_core=%u lle_pending=%u lle_jobs=%llu lle_done=%llu lle_to=%llu lle_sync=%llu lle_runs=%lu lle_insns=%llu lle_rdrom=%lu master=%llu "
            "hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X "

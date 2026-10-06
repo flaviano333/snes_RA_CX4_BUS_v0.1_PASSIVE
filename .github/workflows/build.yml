@@ -1,4 +1,4 @@
-name: Build CX4 SYSCLK ONLY HYBRID V6.2.1
+name: Build CX4 SYSCLK ONLY HYBRID V6.2.2
 
 on:
   workflow_dispatch:
@@ -36,9 +36,9 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Rename UF2
-        run: cp build/cx4_sysclk_only_hybrid_v6_2_1.uf2 build/CX4_SYSCLK_ONLY_HYBRID_V6_2_1_GENERIC.uf2
+        run: cp build/cx4_sysclk_only_hybrid_v6_2_2.uf2 build/CX4_SYSCLK_ONLY_HYBRID_V6_2_2_GENERIC.uf2
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: CX4-SYSCLK-ONLY-HYBRID-V6-2-1
-          path: build/CX4_SYSCLK_ONLY_HYBRID_V6_2_1_GENERIC.uf2
+          name: CX4-SYSCLK-ONLY-HYBRID-V6-2-2
+          path: build/CX4_SYSCLK_ONLY_HYBRID_V6_2_2_GENERIC.uf2

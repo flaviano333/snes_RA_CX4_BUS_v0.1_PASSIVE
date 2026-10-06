@@ -201,7 +201,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 SYSCLK-ONLY HYBRID V6.2.1 ===\n");
+    printf("\n=== SNES RP2350B CX4 SYSCLK-ONLY HYBRID V6.2.2 ===\n");
     printf("clock=%u kHz | proven HLE boot path + exact LLE fallback\n", GAMEPLAY_CLOCK_KHZ);
     printf("existing pinout preserved; NEW: SYSTEM CLK=GP41 only; GP42 /RESET is NOT USED and must remain disconnected\n");
     printf("write authority: PIO+DMA, qualified by /ROMSEL HIGH + /WRAMSEL HIGH\n");
@@ -247,8 +247,8 @@ int main(void) {
     gpio_disable_pulls(PIN_MASTER_CLK);
     pio_gpio_init(pio_clk, PIN_MASTER_CLK);
     pio_sm_set_consecutive_pindirs(pio_clk, sm_clk, PIN_MASTER_CLK, 1, false);
-    uint off_clk = pio_add_program(pio_clk, &snes_master_clock_counter_program);
-    pio_sm_config cfg_clk = snes_master_clock_counter_program_get_default_config(off_clk);
+    uint off_clk = pio_add_program(pio_clk, &snes_sysclk_counter_program);
+    pio_sm_config cfg_clk = snes_sysclk_counter_program_get_default_config(off_clk);
     sm_config_set_in_pins(&cfg_clk, PIN_MASTER_CLK);
     sm_config_set_fifo_join(&cfg_clk, PIO_FIFO_JOIN_RX);
     int init_clk = pio_sm_init(pio_clk, sm_clk, off_clk, &cfg_clk);
@@ -306,7 +306,7 @@ int main(void) {
     pio_sm_set_enabled(pio_lo,sm_lo,true);
 
     cx4bus_launch_core1();
-    printf("READY SYSCLK-ONLY HYBRID V6.2.1. GP42 must be disconnected. Power/reset the SNES with Mega Man X2 selected.\n");
+    printf("READY SYSCLK-ONLY HYBRID V6.2.2. GP42 must be disconnected. Power/reset the SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {
