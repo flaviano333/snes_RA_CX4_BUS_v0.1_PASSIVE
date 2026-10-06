@@ -125,7 +125,7 @@ bank[:len(a.b)] = a.b
 rom=bytearray([0xff])*ROM_SIZE
 # LoROM header at $7FC0 in bank 0.
 header=0x7fc0
-title=b'CX4 BUS VALIDATOR 080 '
+title=b'CX4 BUS VALIDATOR 081 '
 title=title[:21].ljust(21,b' ')
 bank[header:header+21]=title
 bank[header+0x15]=0x20  # LoROM slow

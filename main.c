@@ -1195,6 +1195,7 @@ static void process_read_batch(const uint32_t *low_buf, const uint32_t *high_buf
         uint32_t high20 = unpack_high20(high_buf[i]);
         uint8_t data = reconstruct_data(low18);
         uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
+        cx4bus_pio_read(address, data);
         cx4_observe_read(address, data);
         uint8_t bank = (uint8_t)(address >> 16);
 
@@ -1247,7 +1248,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA + BUS VALIDATOR v0.8 PHI2-WINDOW ===\n");
+    printf("\n=== SNES RP2350B RA + BUS VALIDATOR v0.8.1 PHI2-WINDOW + HOLD ===\n");
     printf("Passive A-bus monitor: /WRAMSEL-qualified writes + qualified READ-REPAIR.\n");
     printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
     printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
@@ -1384,7 +1385,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. RA v2.0 READ-REPAIR preserved; BUS VALIDATOR v0.8 PHI2-WINDOW available; drive starts OFF.\n");
+    printf("READY. RA v2.0 READ-REPAIR preserved; BUS VALIDATOR v0.8.1 PHI2-WINDOW + HOLD available; drive starts OFF.\n");
     printf("Use INFO, WRAMSEL, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
