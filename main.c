@@ -31,7 +31,7 @@ static void strtoupper_inplace(char *s) {
 }
 
 static void command_info(void) {
-    printf("LASTBUS clock_khz=%u capture=SIO_SINGLE_SNAPSHOT\n", GAMEPLAY_CLOCK_KHZ);
+    printf("LASTBUS clock_khz=%u capture=SIO_EARLY_READ\n", GAMEPLAY_CLOCK_KHZ);
     cx4bus_print_status();
 }
 
@@ -73,10 +73,10 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 SINGLE-SNAPSHOT LLE V8.2 LIVE INTERLEAVE ===\n");
-    printf("clock=%u kHz | no PIO/DMA write pairing; Core1 captures one coherent A-bus write event per PHI2 cycle\n", GAMEPLAY_CLOCK_KHZ);
+    printf("\n=== SNES RP2350B CX4 EARLY-READ LLE V8.3 ===\n");
+    printf("clock=%u kHz | Core1 predrives CX4 read DATA during PHI2-low; writes remain single-snapshot\n", GAMEPLAY_CLOCK_KHZ);
     printf("GP41/GP42 unused. Original A-bus only. GP25=A13 must be electrically sound.\n");
-    printf("Core1: physical read responder + SPSC write producer; Core0: HG51B LLE consumer.\n\n");
+    printf("Core1: early physical read responder + SPSC write producer; Core0: HG51B LLE consumer.\n\n");
     fflush(stdout);
 
     for (uint pin=0; pin<=40u; ++pin) {
@@ -85,7 +85,7 @@ int main(void) {
 
     cx4bus_init();
     cx4bus_launch_core1();
-    printf("READY SINGLE-SNAPSHOT LLE V8.2 LIVE INTERLEAVE. Power/reset SNES with Mega Man X2 selected.\n");
+    printf("READY EARLY-READ LLE V8.3. Power/reset SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {

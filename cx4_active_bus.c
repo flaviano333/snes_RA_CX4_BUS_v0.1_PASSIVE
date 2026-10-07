@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 SINGLE-SNAPSHOT LLE V8.2 LIVE INTERLEAVE
+ * CX4 EARLY-READ LLE V8.3
  *
  * This build deliberately abandons command-by-command HLE.  Every physical write is captured as one coherent SIO snapshot by Core1 and
  * queued to Core0. This deliberately removes the old two-PIO/two-DMA pairing
@@ -92,6 +92,13 @@ static volatile uint64_t s_cpu_reads = 0;
 static volatile uint64_t s_cpu_writes = 0;
 static volatile uint64_t s_driven_reads = 0;
 static volatile uint64_t s_reset_vectors = 0;
+
+/* Physical read timing diagnostics.  A predrive is prepared while PHI2 is low,
+ * before the CPU sampling window.  late is the fallback path where the cycle
+ * was not stable soon enough and we had to drive after PHI2 rose. */
+static volatile uint64_t s_read_predrive = 0;
+static volatile uint64_t s_read_late = 0;
+static volatile uint64_t s_read_retarget = 0;
 
 /* Single-producer (Core1), single-consumer (Core0) write queue. The queue is
  * deliberately large enough to absorb short bursts while HG51B is executing. */
@@ -432,8 +439,60 @@ void cx4bus_reset_state(void) { s_reset_requested = true; }
 static void __not_in_flash_func(core1_loop)(void) {
     s_core1_started = true;
     data_release();
+
     for (;;) {
+        /* Wait for the beginning of PHI2-low.  Unlike V8.2, reads are decoded
+           during LOW so DATA can already be valid BEFORE PHI2 rises. */
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
+
+        bool predriven = false;
+        uint16_t pre_off = 0;
+        uint8_t pre_v = 0;
+
+        /* Address/control lines can move immediately after PHI2 falls.  Require
+           two consecutive coherent snapshots of the same CX4 read before
+           enabling DATA outputs.  DATA bits themselves are deliberately not
+           part of the stability test. */
+        for (;;) {
+            uint32_t lo1 = sio_hw->gpio_in;
+            uint32_t hi1 = sio_hw->gpio_hi_in;
+            if (lo1 & PHI2_MASK) break;
+
+            const bool rd1 = (hi1 & RD_HI_MASK) == 0u;
+            const bool ctrl1 = rd1 &&
+                ((lo1 & WR_MASK) != 0u) &&
+                ((hi1 & ROMSEL_HI_MASK) != 0u) &&
+                ((hi1 & WRAMSEL_HI_MASK) != 0u) &&
+                raw_is_cx4(lo1, hi1);
+            if (!ctrl1) continue;
+
+            uint16_t off1 = raw_cx4_offset(lo1, hi1);
+            __asm volatile("nop; nop;" ::: "memory");
+            uint32_t lo2 = sio_hw->gpio_in;
+            uint32_t hi2 = sio_hw->gpio_hi_in;
+            if (lo2 & PHI2_MASK) break;
+
+            const bool rd2 = (hi2 & RD_HI_MASK) == 0u;
+            const bool ctrl2 = rd2 &&
+                ((lo2 & WR_MASK) != 0u) &&
+                ((hi2 & ROMSEL_HI_MASK) != 0u) &&
+                ((hi2 & WRAMSEL_HI_MASK) != 0u) &&
+                raw_is_cx4(lo2, hi2);
+            if (!ctrl2) continue;
+
+            uint16_t off2 = raw_cx4_offset(lo2, hi2);
+            if (off1 != off2) continue;
+
+            pre_off = off2;
+            pre_v = bus_read(pre_off);
+            if (s_armed) data_drive(pre_v);
+            predriven = true;
+            s_read_predrive++;
+            break;
+        }
+
+        /* Rising edge: writes are sampled here as before.  For a read, this is
+           only a validation/fallback point; the normal path is already driving. */
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
         __asm volatile("nop; nop;" ::: "memory");
         uint32_t lo = sio_hw->gpio_in;
@@ -445,23 +504,53 @@ static void __not_in_flash_func(core1_loop)(void) {
             const bool ctrl_ok =
                 ((hi & ROMSEL_HI_MASK) != 0u) &&
                 ((hi & WRAMSEL_HI_MASK) != 0u) &&
-                ((lo & WR_MASK) != 0u);
-            if (ctrl_ok && raw_is_cx4(lo, hi)) {
+                ((lo & WR_MASK) != 0u) &&
+                raw_is_cx4(lo, hi);
+
+            if (ctrl_ok) {
                 uint16_t off = raw_cx4_offset(lo, hi);
-                uint8_t v = bus_read(off);
-                s_cpu_reads++; s_last_read_addr = off; s_last_read_data = v;
+                uint8_t v;
+                if (predriven && off == pre_off) {
+                    v = pre_v;
+                } else {
+                    /* If the LOW-phase address changed underneath us, retarget
+                       immediately.  This is diagnostic: the desired path is
+                       predrive, not this late fallback. */
+                    if (predriven) {
+                        if (s_driving) data_release();
+                        s_read_retarget++;
+                    }
+                    v = bus_read(off);
+                    if (s_armed) data_drive(v);
+                    s_read_late++;
+                }
+                s_cpu_reads++;
+                s_last_read_addr = off;
+                s_last_read_data = v;
                 trace_io('R', off, v);
-                if (s_armed) { data_drive(v); s_driven_reads++; }
             } else {
+                if (predriven) {
+                    /* A speculative LOW-phase decode did not survive to PHI2-high. */
+                    if (s_driving) data_release();
+                    s_read_retarget++;
+                }
                 uint32_t a = raw_address24(lo, hi);
                 if (a == 0x00fffcu) s_reset_arm = 8;
                 else if (a == 0x00fffdu && s_reset_arm) {
                     s_reset_vectors++; s_reset_requested = true; s_reset_arm = 0;
                 } else if (s_reset_arm) --s_reset_arm;
             }
+
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
             if (s_driving) data_release();
             continue;
+        }
+
+        /* If this became a write/non-read after a speculative decode, never
+           leave our DATA drivers enabled. */
+        if (predriven && s_driving) {
+            data_release();
+            s_read_retarget++;
         }
 
         if (wr && raw_is_cx4(lo, hi)) {
@@ -470,15 +559,10 @@ static void __not_in_flash_func(core1_loop)(void) {
                 ((hi & ROMSEL_HI_MASK) != 0u) &&
                 ((hi & WRAMSEL_HI_MASK) != 0u);
 
-            /* Sample the data from the SAME physical bus cycle whose address was
-               decoded above. This one event is now authoritative; no PIO pairing. */
             __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
             uint8_t v = raw_data(sio_hw->gpio_in);
 
             if (ctrl_ok_w) {
-                /* Queue first, then expose the accepted trigger as pending.
-                   bus_read() keeps BUSY/RUNNING asserted until Core0 consumes it,
-                   so back-to-back $7F48/$7F4F cannot create a false idle gap. */
                 bool queued = write_q_push(off, v);
                 if (queued) {
                     if (is_busy_trigger(off)) {
@@ -498,6 +582,7 @@ static void __not_in_flash_func(core1_loop)(void) {
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
             continue;
         }
+
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
     }
 }
@@ -605,12 +690,14 @@ void cx4bus_print_runs(void) {
 }
 
 void cx4bus_print_queue(void) {
-    printf("CX4Q depth=%lu pending_run=%lu pending_busy=%lu pushed=%llu popped=%llu dropped=%llu peak=%lu last_phys=%02X last_core=%02X\n",
+    printf("CX4Q depth=%lu pending_run=%lu pending_busy=%lu pushed=%llu popped=%llu dropped=%llu peak=%lu predrive=%llu late=%llu retarget=%llu last_phys=%02X last_core=%02X\n",
            (unsigned long)write_q_depth(),
            (unsigned long)__atomic_load_n(&s_pending_run,__ATOMIC_ACQUIRE),
            (unsigned long)__atomic_load_n(&s_pending_busy,__ATOMIC_ACQUIRE),
            (unsigned long long)s_q_pushed,(unsigned long long)s_q_popped,
            (unsigned long long)s_q_dropped,(unsigned long)s_q_peak,
+           (unsigned long long)s_read_predrive,(unsigned long long)s_read_late,
+           (unsigned long long)s_read_retarget,
            s_q_last_phys_cmd,s_q_last_core_cmd);
     printf("CX4Q cmd_phys 00=%llu AF=%llu other=%llu | cmd_core 00=%llu AF=%llu other=%llu idle=%llu running=%llu\n",
            (unsigned long long)s_cmd_phys_00,(unsigned long long)s_cmd_phys_af,(unsigned long long)s_cmd_phys_other,
@@ -678,12 +765,12 @@ void cx4bus_print_status(void) {
         firmware=cx4_firmware_loaded(s_cx4);
         locked=cx4_locked(s_cx4);
     }
-    printf("CX4STAT mode=SINGLE_SNAPSHOT_LLE_V8_2_LIVE armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+    printf("CX4STAT mode=EARLY_READ_LLE_V8_3 armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
            "q_depth=%lu q_prun=%lu q_pbusy=%lu q_push=%llu q_pop=%llu q_drop=%llu q_peak=%lu "
            "svc=%llu yields=%llu wb_hit=%llu txb_hit=%llu tx_prog=%lu "
            "tx_active=%u tx_jobs=%llu tx_done=%llu tx_to=%llu tx_chunks=%llu tx_busy_reads=%llu tx_early=%llu tx_locked=%llu tx_last=%02X/%02X/%lu "
            "lle_runs=%lu lle_insns=%llu lle_rdrom=%lu lle_distinct=%lu lle_range=%lu-%lu firmware=%d locked=%d master=%llu status=%02X "
-           "cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X "
+           "cpu_r=%llu cpu_w=%llu driven=%llu predrive=%llu late=%llu retarget=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X "
            "cmd_phys=%02X cmd_core=%02X cmd00=%llu/%llu cmdAF=%llu/%llu cmdOther=%llu/%llu cmdIdle=%llu cmdRunning=%llu\n",
            s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_cx4?1u:0u,
            s_rom_slot_valid?1u:0u,(unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
@@ -704,6 +791,7 @@ void cx4bus_print_status(void) {
            (unsigned long)lo,(unsigned long)hi,firmware,locked,(unsigned long long)s_virtual_master,
            __atomic_load_n(&s_status_proxy,__ATOMIC_ACQUIRE),
            (unsigned long long)s_cpu_reads,(unsigned long long)s_cpu_writes,(unsigned long long)s_driven_reads,
+           (unsigned long long)s_read_predrive,(unsigned long long)s_read_late,(unsigned long long)s_read_retarget,
            (unsigned long long)s_reset_vectors,(unsigned long long)s_state_resets,
            (unsigned long)s_last_read_addr,s_last_read_data,(unsigned long)s_last_write_addr,s_last_write_data,
            s_q_last_phys_cmd,s_q_last_core_cmd,
