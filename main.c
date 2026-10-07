@@ -36,6 +36,16 @@ static uint64_t write_pairs_qualified = 0;
 static uint64_t write_pairs_rejected_ctrl = 0;
 static uint64_t dma_rearms = 0;
 
+/* Address forensics for control-qualified writes.  The Cx4 coarse window has
+ * fixed A13=1, A14=1, A15=0, A22=0.  If one sampled line is wrong we can
+ * identify it statistically and optionally force that bit in software. */
+static uint64_t diag_raw_valid = 0;
+static uint64_t diag_pattern[16] = {0};
+static uint64_t diag_onefix[4] = {0}; /* A13=1,A14=1,A15=0,A22=0 */
+static uint32_t diag_examples[16] = {0};
+static uint8_t diag_example_data[16] = {0};
+static uint32_t diag_example_n = 0;
+
 static char cmd_buf[96];
 static size_t cmd_len = 0;
 
@@ -92,6 +102,95 @@ static inline uint32_t captured_pair_count(void) {
     return cl < ch ? cl : ch;
 }
 
+static inline bool addr24_is_cx4(uint32_t a) {
+    return ((a & (1u<<22)) == 0u) && ((a & (1u<<15)) == 0u) &&
+           ((a & (1u<<14)) != 0u) && ((a & (1u<<13)) != 0u);
+}
+
+static inline uint32_t force_addr_bit(uint32_t a, uint bit, bool one) {
+    uint32_t m = 1u << bit;
+    return one ? (a | m) : (a & ~m);
+}
+
+static void diag_address(uint32_t a, uint8_t data) {
+    uint pattern = 0u;
+    if (a & (1u<<13)) pattern |= 1u;
+    if (a & (1u<<14)) pattern |= 2u;
+    if (a & (1u<<15)) pattern |= 4u;
+    if (a & (1u<<22)) pattern |= 8u;
+    diag_pattern[pattern]++;
+    if (addr24_is_cx4(a)) diag_raw_valid++;
+    if (addr24_is_cx4(force_addr_bit(a,13u,true)))  diag_onefix[0]++;
+    if (addr24_is_cx4(force_addr_bit(a,14u,true)))  diag_onefix[1]++;
+    if (addr24_is_cx4(force_addr_bit(a,15u,false))) diag_onefix[2]++;
+    if (addr24_is_cx4(force_addr_bit(a,22u,false))) diag_onefix[3]++;
+    if (diag_example_n < 16u) {
+        diag_examples[diag_example_n] = a;
+        diag_example_data[diag_example_n] = data;
+        diag_example_n++;
+    }
+}
+
+static void command_busmap(void) {
+    uint32_t fm=0,fv=0;
+    cx4bus_get_addr_fix(&fm,&fv);
+    printf("BUSMAP qualified=%llu raw_valid=%llu fix=%06lX/%06lX onefix A13=1:%llu A14=1:%llu A15=0:%llu A22=0:%llu\n",
+           (unsigned long long)write_pairs_qualified,
+           (unsigned long long)diag_raw_valid,
+           (unsigned long)fm,(unsigned long)fv,
+           (unsigned long long)diag_onefix[0],(unsigned long long)diag_onefix[1],
+           (unsigned long long)diag_onefix[2],(unsigned long long)diag_onefix[3]);
+    printf("BUSMAP pattern[A22 A15 A14 A13] 0000..1111:");
+    for (unsigned i=0;i<16;i++) printf(" %X=%llu",i,(unsigned long long)diag_pattern[i]);
+    printf("\nBUSMAP examples:");
+    for (uint32_t i=0;i<diag_example_n;i++) printf(" %06lX:%02X",(unsigned long)diag_examples[i],diag_example_data[i]);
+    printf("\n");
+}
+
+static void command_busclr(void) {
+    diag_raw_valid=0;
+    memset(diag_pattern,0,sizeof(diag_pattern));
+    memset(diag_onefix,0,sizeof(diag_onefix));
+    diag_example_n=0;
+    printf("OK BUSMAP counters cleared\n");
+}
+
+static void command_addrfix(const char *arg) {
+    uint32_t mask=0,value=0;
+    if (!strcmp(arg,"OFF")) {
+        cx4bus_set_addr_fix(0,0);
+        printf("OK ADDRFIX OFF; reset/power-cycle SNES before judging gameplay\n");
+        return;
+    }
+    if (!strcmp(arg,"A13") || !strcmp(arg,"13")) { mask=1u<<13; value=1u<<13; }
+    else if (!strcmp(arg,"A14") || !strcmp(arg,"14")) { mask=1u<<14; value=1u<<14; }
+    else if (!strcmp(arg,"A15") || !strcmp(arg,"15")) { mask=1u<<15; value=0; }
+    else if (!strcmp(arg,"A22") || !strcmp(arg,"22")) { mask=1u<<22; value=0; }
+    else if (!strcmp(arg,"AUTO")) {
+        unsigned best=0, second=1;
+        for (unsigned i=0;i<4;i++) if (diag_onefix[i]>diag_onefix[best]) best=i;
+        second = (best==0)?1:0;
+        for (unsigned i=0;i<4;i++) if (i!=best && diag_onefix[i]>diag_onefix[second]) second=i;
+        uint64_t b=diag_onefix[best], s2=diag_onefix[second];
+        if (b < 100u || b < (s2*2u + 1u) || b <= diag_raw_valid) {
+            printf("ERR ADDRFIX AUTO low confidence best=%llu second=%llu raw=%llu; use BUSMAP\n",
+                   (unsigned long long)b,(unsigned long long)s2,(unsigned long long)diag_raw_valid);
+            return;
+        }
+        const uint bits[4]={13,14,15,22};
+        const bool ones[4]={true,true,false,false};
+        mask=1u<<bits[best]; value=ones[best]?mask:0u;
+        printf("AUTO selected A%u=%u score=%llu second=%llu\n",bits[best],ones[best]?1u:0u,
+               (unsigned long long)b,(unsigned long long)s2);
+    } else {
+        printf("ERR ADDRFIX use OFF/A13/A14/A15/A22/AUTO\n");
+        return;
+    }
+    cx4bus_set_addr_fix(mask,value);
+    printf("OK ADDRFIX mask=%06lX value=%06lX; now reset/power-cycle SNES\n",
+           (unsigned long)mask,(unsigned long)value);
+}
+
 static void feed_write_prefix(uint buf) {
     uint32_t count = captured_pair_count();
     if (count > SAMPLE_COUNT) count = SAMPLE_COUNT;
@@ -109,6 +208,7 @@ static void feed_write_prefix(uint buf) {
         }
         uint32_t address = reconstruct_address(lo, hi);
         uint8_t data = reconstruct_data(lo);
+        diag_address(address, data);
         cx4bus_pio_write(address, data);
         write_pairs_qualified++;
     }
@@ -150,8 +250,11 @@ static void execute_command(char *line) {
     else if (!strcmp(line,"CX4ARM")) { cx4bus_arm(true); printf("OK CX4 armed\n"); }
     else if (!strcmp(line,"CX4DISARM")) { cx4bus_arm(false); printf("OK CX4 disarmed; DATA Hi-Z\n"); }
     else if (!strcmp(line,"CX4RESET")) { cx4bus_reset_state(); printf("OK virtual CX4 reset requested\n"); }
+    else if (!strcmp(line,"BUSMAP")) command_busmap();
+    else if (!strcmp(line,"BUSCLR")) command_busclr();
+    else if (!strncmp(line,"ADDRFIX ",8)) command_addrfix(line+8);
     else if (!strcmp(line,"HELP")) {
-        printf("Commands: INFO/CX4STAT CX4TRACE CX4RUNS CX4SELF CX4ARM CX4DISARM CX4RESET\n");
+        printf("Commands: INFO/CX4STAT CX4TRACE CX4RUNS CX4SELF CX4ARM CX4DISARM CX4RESET BUSMAP BUSCLR ADDRFIX OFF/A13/A14/A15/A22/AUTO\n");
     } else if (*line) printf("ERR unknown command\n");
     fflush(stdout);
 }
@@ -176,7 +279,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 LLE TRANSACTIONAL V7 ===\n");
+    printf("\n=== SNES RP2350B CX4 LLE TRANSACTIONAL V7.1 BUSMAP ===\n");
     printf("clock=%u kHz | V4 physical bus + instruction-level HG51B transactional engine\n", GAMEPLAY_CLOCK_KHZ);
     printf("pinout unchanged: PHI2=GP0 /WR=GP1 D0-2=GP2-4 GP5=SKIP D3-7=GP6-10 /RD=GP35 /ROMSEL=GP38 /WRAMSEL=GP39 A10=GP40\n");
     printf("write authority: PIO+DMA, qualified by /ROMSEL HIGH + /WRAMSEL HIGH\n");
@@ -254,7 +357,7 @@ int main(void) {
     pio_sm_set_enabled(pio_lo,sm_lo,true);
 
     cx4bus_launch_core1();
-    printf("READY LLE TRANSACTIONAL V7. GP41/GP42 are unused; power/reset SNES with Mega Man X2 selected.\n");
+    printf("READY LLE TRANSACTIONAL V7.1 BUSMAP. GP41/GP42 are unused; power/reset SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {

@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 LLE TRANSACTIONAL V7
+ * CX4 LLE TRANSACTIONAL V7.1 BUSMAP
  *
  * This build deliberately abandons command-by-command HLE.  Every physical
  * write to the Cx4 window is fed to the instruction-level HG51B core.  If that
@@ -93,6 +93,11 @@ static volatile uint32_t s_last_write_addr = 0;
 static volatile uint8_t s_last_read_data = 0;
 static volatile uint8_t s_last_write_data = 0;
 
+/* Optional software repair for constant address bits used by the Cx4 decode.
+ * This lets us compensate for one bad/misread address line without rewiring. */
+static volatile uint32_t s_addr_force_mask = 0u;
+static volatile uint32_t s_addr_force_value = 0u;
+
 static volatile uint64_t s_tx_jobs = 0;
 static volatile uint64_t s_tx_done = 0;
 static volatile uint64_t s_tx_timeout = 0;
@@ -141,11 +146,22 @@ static inline void data_drive(uint8_t v) {
     s_driving = true;
 }
 
+static inline bool addr_bit_fixed(uint32_t bit, bool raw) {
+    uint32_t m = 1u << bit;
+    if (__atomic_load_n(&s_addr_force_mask, __ATOMIC_RELAXED) & m)
+        return (__atomic_load_n(&s_addr_force_value, __ATOMIC_RELAXED) & m) != 0u;
+    return raw;
+}
+
 static inline bool raw_is_cx4(uint32_t lo, uint32_t hi) {
-    if (hi & A22_HI_MASK) return false;  /* banks 40-7F/C0-FF excluded */
-    if (lo & A15_MASK) return false;
-    if (!(lo & A14_MASK)) return false;
-    if (!(lo & A13_MASK)) return false;
+    bool a22 = addr_bit_fixed(22u, (hi & A22_HI_MASK) != 0u);
+    bool a15 = addr_bit_fixed(15u, (lo & A15_MASK) != 0u);
+    bool a14 = addr_bit_fixed(14u, (lo & A14_MASK) != 0u);
+    bool a13 = addr_bit_fixed(13u, (lo & A13_MASK) != 0u);
+    if (a22) return false;   /* banks 40-7F/C0-FF excluded */
+    if (a15) return false;
+    if (!a14) return false;
+    if (!a13) return false;
     return true;
 }
 static inline uint16_t raw_cx4_offset(uint32_t lo, uint32_t hi) {
@@ -378,6 +394,21 @@ static void __not_in_flash_func(core1_loop)(void) {
     }
 }
 
+void cx4bus_set_addr_fix(uint32_t mask, uint32_t value) {
+    /* Only these bits are meaningful to the Cx4 coarse decode. */
+    const uint32_t allowed = (1u<<13) | (1u<<14) | (1u<<15) | (1u<<22);
+    mask &= allowed;
+    value &= allowed;
+    __atomic_store_n(&s_addr_force_value, value, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_addr_force_mask, mask, __ATOMIC_RELEASE);
+    data_release();
+}
+
+void cx4bus_get_addr_fix(uint32_t *mask, uint32_t *value) {
+    if (mask) *mask = __atomic_load_n(&s_addr_force_mask, __ATOMIC_ACQUIRE);
+    if (value) *value = __atomic_load_n(&s_addr_force_value, __ATOMIC_ACQUIRE);
+}
+
 void cx4bus_launch_core1(void) {
     if (s_core1_started) return;
     multicore_launch_core1(core1_loop);
@@ -385,6 +416,9 @@ void cx4bus_launch_core1(void) {
 }
 
 void cx4bus_pio_write(uint32_t address, uint8_t data) {
+    uint32_t fm = __atomic_load_n(&s_addr_force_mask, __ATOMIC_ACQUIRE);
+    uint32_t fv = __atomic_load_n(&s_addr_force_value, __ATOMIC_ACQUIRE);
+    address = (address & ~fm) | (fv & fm);
     uint8_t bank = (uint8_t)(address >> 16);
     uint16_t off = (uint16_t)address;
     if (!cx4_bank(bank) || off < 0x6000u || off > 0x7fffu) return;
@@ -501,7 +535,7 @@ void cx4bus_print_status(void) {
         firmware=cx4_firmware_loaded(s_cx4);
         locked=cx4_locked(s_cx4);
     }
-    printf("CX4STAT mode=LLE_TRANSACTIONAL_V7 armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+    printf("CX4STAT mode=LLE_TRANSACTIONAL_V7_1_BUSMAP armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
            "tx_active=%u tx_jobs=%llu tx_done=%llu tx_to=%llu tx_chunks=%llu tx_busy_reads=%llu tx_early=%llu tx_locked=%llu tx_last=%02X/%02X/%lu "
            "lle_runs=%lu lle_insns=%llu lle_rdrom=%lu lle_distinct=%lu lle_range=%lu-%lu firmware=%d locked=%d master=%llu status=%02X "
            "pio_w=%llu pio_ram=%llu pio_io=%llu cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
