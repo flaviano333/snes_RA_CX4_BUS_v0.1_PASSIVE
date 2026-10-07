@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 SINGLE-SNAPSHOT LLE V8
+ * CX4 SINGLE-SNAPSHOT LLE V8.1 COOPERATIVE
  *
  * This build deliberately abandons command-by-command HLE.  Every physical write is captured as one coherent SIO snapshot by Core1 and
  * queued to Core0. This deliberately removes the old two-PIO/two-DMA pairing
@@ -53,6 +53,8 @@
  * ~0.78 s of emulated time before declaring a wedge. */
 #define TX_MASTER_CHUNK 4096u
 #define TX_MAX_CHUNKS   4096u
+#define SERVICE_WRITE_BUDGET 256u
+#define SERVICE_TX_CHUNK_BUDGET 4u
 
 typedef struct {
     uint32_t magic;
@@ -120,6 +122,11 @@ static volatile uint64_t s_tx_locked = 0;
 static volatile uint8_t s_tx_last_entry = 0xffu;
 static volatile uint8_t s_tx_last_status = 0;
 static volatile uint32_t s_tx_last_chunks = 0;
+static volatile uint32_t s_tx_progress_chunks = 0;
+static volatile uint64_t s_service_calls = 0;
+static volatile uint64_t s_service_yields = 0;
+static volatile uint64_t s_service_write_budget_hits = 0;
+static volatile uint64_t s_service_tx_budget_hits = 0;
 
 /* Tiny physical IO trace. */
 typedef struct { uint16_t off; uint8_t data; uint8_t op; } trace_t;
@@ -298,40 +305,55 @@ static void mirror_refresh_all(void) {
     __atomic_store_n(&s_status_proxy, s_shadow[0x1f5eu], __ATOMIC_RELEASE);
 }
 
-static bool transaction_run_until_idle(void) {
+static bool transaction_begin_if_needed(void) {
     if (!s_cx4) return false;
 
     uint8_t st = cx4_read(s_cx4, 0x7f5eu);
     __atomic_store_n(&s_status_proxy, st, __ATOMIC_RELEASE);
-    if ((st & 0xc0u) == 0u) return true;
+    if ((st & 0xc0u) == 0u) return false;
 
-    __atomic_store_n(&s_tx_active, 1u, __ATOMIC_RELEASE);
-    s_tx_jobs++;
-    uint32_t chunks = 0;
+    if (!__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&s_tx_active, 1u, __ATOMIC_RELEASE);
+        s_tx_jobs++;
+        s_tx_progress_chunks = 0;
+    }
+    return true;
+}
 
-    for (; chunks < TX_MAX_CHUNKS; ++chunks) {
+/* Advance only a small bounded slice of HG51B time.  This MUST return to the
+   main loop frequently so TinyUSB/stdio cannot be starved by a long Cx4 job. */
+static void transaction_step_budget(uint32_t budget) {
+    if (!s_cx4 || !__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) return;
+
+    uint8_t st = cx4_read(s_cx4, 0x7f5eu);
+    uint32_t used = 0;
+    while ((st & 0xc0u) != 0u && used < budget && s_tx_progress_chunks < TX_MAX_CHUNKS) {
         s_virtual_master += TX_MASTER_CHUNK;
         cx4_sync(s_cx4, s_virtual_master);
         s_tx_chunks++;
+        s_tx_progress_chunks++;
+        used++;
         st = cx4_read(s_cx4, 0x7f5eu);
         __atomic_store_n(&s_status_proxy, st, __ATOMIC_RELEASE);
-        if ((st & 0xc0u) == 0u) break;
-        if (cx4_locked(s_cx4)) { s_tx_locked++; break; }
+        if (cx4_locked(s_cx4)) {
+            s_tx_locked++;
+            break;
+        }
     }
 
-    s_tx_last_chunks = chunks + 1u;
-    s_tx_last_status = st;
+    if ((st & 0xc0u) != 0u && !cx4_locked(s_cx4) && s_tx_progress_chunks < TX_MAX_CHUNKS) {
+        s_service_tx_budget_hits++;
+        return;
+    }
 
+    s_tx_last_chunks = s_tx_progress_chunks;
+    s_tx_last_status = st;
     mirror_refresh_all();
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&s_tx_active, 0u, __ATOMIC_RELEASE);
 
-    if ((st & 0xc0u) == 0u) {
-        s_tx_done++;
-        return true;
-    }
-    s_tx_timeout++;
-    return false;
+    if ((st & 0xc0u) == 0u) s_tx_done++;
+    else s_tx_timeout++;
 }
 
 static void clear_runtime_state(void) {
@@ -345,6 +367,9 @@ static void clear_runtime_state(void) {
     s_tx_last_entry = 0xffu;
     s_tx_last_status = 0;
     s_tx_last_chunks = 0;
+    s_tx_progress_chunks = 0;
+    s_service_calls = s_service_yields = 0;
+    s_service_write_budget_hits = s_service_tx_budget_hits = 0;
     s_trace_seq = 0;
     /* Flush any physical writes that belonged to the pre-reset machine state. */
     uint32_t h = __atomic_load_n(&s_write_head, __ATOMIC_ACQUIRE);
@@ -485,25 +510,47 @@ static void apply_write(uint16_t off, uint8_t data) {
     /* Any write may legally start cache fill, DMA, or program execution. */
     uint8_t st = cx4_read(s_cx4, 0x7f5eu);
     __atomic_store_n(&s_status_proxy, st, __ATOMIC_RELEASE);
-    if (st & 0xc0u) (void)transaction_run_until_idle();
+    if (st & 0xc0u) (void)transaction_begin_if_needed();
     else if (c >= 0x6c00u) shadow_store(c, cx4_read(s_cx4, c));
 }
 
 void cx4bus_service(void) {
+    s_service_calls++;
+
     if (s_reset_requested) {
         s_reset_requested = false;
         clear_runtime_state();
+        return;
+    }
+
+    /* If the HG51B is running, advance a bounded slice and yield immediately.
+       Writes captured meanwhile remain ordered in the SPSC queue. */
+    if (__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) {
+        transaction_step_budget(SERVICE_TX_CHUNK_BUDGET);
+        s_service_yields++;
+        return;
     }
 
     write_evt_t e;
-    while (write_q_pop(&e)) {
+    uint32_t processed = 0;
+    while (processed < SERVICE_WRITE_BUDGET && write_q_pop(&e)) {
         const bool trigger = is_start_trigger(e.off);
         apply_write(e.off, e.data);
+        processed++;
+
         if (trigger) {
             uint32_t p = __atomic_load_n(&s_start_pending, __ATOMIC_ACQUIRE);
             if (p) __atomic_fetch_sub(&s_start_pending, 1u, __ATOMIC_ACQ_REL);
         }
+
+        /* Preserve bus ordering: once a write starts cache/DMA/HG51B work,
+           leave later physical writes queued until that operation reaches idle. */
+        if (__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) break;
     }
+
+    if (processed == SERVICE_WRITE_BUDGET && write_q_depth())
+        s_service_write_budget_hits++;
+    s_service_yields++;
 }
 
 void cx4bus_print_trace(void) {
@@ -599,8 +646,9 @@ void cx4bus_print_status(void) {
         firmware=cx4_firmware_loaded(s_cx4);
         locked=cx4_locked(s_cx4);
     }
-    printf("CX4STAT mode=SINGLE_SNAPSHOT_LLE_V8 armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+    printf("CX4STAT mode=SINGLE_SNAPSHOT_LLE_V8_1_COOP armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
            "q_depth=%lu q_pending=%lu q_push=%llu q_pop=%llu q_drop=%llu q_peak=%lu "
+           "svc=%llu yields=%llu wb_hit=%llu txb_hit=%llu tx_prog=%lu "
            "tx_active=%u tx_jobs=%llu tx_done=%llu tx_to=%llu tx_chunks=%llu tx_busy_reads=%llu tx_early=%llu tx_locked=%llu tx_last=%02X/%02X/%lu "
            "lle_runs=%lu lle_insns=%llu lle_rdrom=%lu lle_distinct=%lu lle_range=%lu-%lu firmware=%d locked=%d master=%llu status=%02X "
            "cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X "
@@ -609,6 +657,9 @@ void cx4bus_print_status(void) {
            s_rom_slot_valid?1u:0u,(unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
            (unsigned long)write_q_depth(),(unsigned long)__atomic_load_n(&s_start_pending,__ATOMIC_ACQUIRE),(unsigned long long)s_q_pushed,(unsigned long long)s_q_popped,
            (unsigned long long)s_q_dropped,(unsigned long)s_q_peak,
+           (unsigned long long)s_service_calls,(unsigned long long)s_service_yields,
+           (unsigned long long)s_service_write_budget_hits,(unsigned long long)s_service_tx_budget_hits,
+           (unsigned long)s_tx_progress_chunks,
            __atomic_load_n(&s_tx_active,__ATOMIC_ACQUIRE)?1u:0u,
            (unsigned long long)s_tx_jobs,(unsigned long long)s_tx_done,(unsigned long long)s_tx_timeout,
            (unsigned long long)s_tx_chunks,(unsigned long long)s_tx_busy_reads,
