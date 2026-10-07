@@ -1,4 +1,4 @@
-name: Build CX4 SINGLE SNAPSHOT LLE V8.1 COOPERATIVE
+name: Build CX4 SINGLE SNAPSHOT LLE V8.2 LIVE INTERLEAVE
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
       - name: Static architecture checks
         run: |
           ! grep -R "hle_conv_oam\|hle_math_command\|hle_on_command" -n cx4_active_bus.c
-          grep -q "SINGLE_SNAPSHOT_LLE_V8_1_COOP" cx4_active_bus.c
+          grep -q "SINGLE_SNAPSHOT_LLE_V8_2_LIVE" cx4_active_bus.c
           grep -q "write_q_push" cx4_active_bus.c
           grep -q "SIO_SINGLE_SNAPSHOT" main.c
           ! grep -R "pico_generate_pio_header\|hardware_pio\|hardware_dma" -n CMakeLists.txt main.c
@@ -50,9 +50,9 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Rename UF2
-        run: cp build/cx4_single_snapshot_lle_v8_1.uf2 build/CX4_SINGLE_SNAPSHOT_LLE_V8_1_COOP_GENERIC_SEM_ROM.uf2
+        run: cp build/cx4_single_snapshot_lle_v8_2.uf2 build/CX4_SINGLE_SNAPSHOT_LLE_V8_2_LIVE_GENERIC_SEM_ROM.uf2
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: CX4-SINGLE-SNAPSHOT-LLE-V8-1-COOP
-          path: build/CX4_SINGLE_SNAPSHOT_LLE_V8_1_COOP_GENERIC_SEM_ROM.uf2
+          name: CX4-SINGLE-SNAPSHOT-LLE-V8-2-LIVE
+          path: build/CX4_SINGLE_SNAPSHOT_LLE_V8_2_LIVE_GENERIC_SEM_ROM.uf2

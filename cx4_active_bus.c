@@ -10,7 +10,7 @@
 #include "cx4.h"
 
 /*
- * CX4 SINGLE-SNAPSHOT LLE V8.1 COOPERATIVE
+ * CX4 SINGLE-SNAPSHOT LLE V8.2 LIVE INTERLEAVE
  *
  * This build deliberately abandons command-by-command HLE.  Every physical write is captured as one coherent SIO snapshot by Core1 and
  * queued to Core0. This deliberately removes the old two-PIO/two-DMA pairing
@@ -51,10 +51,14 @@
  * not wall-clock timing: it is a monotonic virtual timeline used only by the
  * upstream 20 MHz / 21.477 MHz rate converter.  4096 chunks gives a generous
  * ~0.78 s of emulated time before declaring a wedge. */
-#define TX_MASTER_CHUNK 4096u
-#define TX_MAX_CHUNKS   4096u
-#define SERVICE_WRITE_BUDGET 256u
-#define SERVICE_TX_CHUNK_BUDGET 4u
+#define TX_MASTER_CHUNK 512u
+/* V8.2 no longer aborts a live DSP after an arbitrary number of chunks.
+ * Long-running detection is diagnostic only; CPU writes continue to be
+ * consumed and can legitimately change state while the DSP is running. */
+#define TX_LONGRUN_CHUNKS 32768u
+#define SELF_MAX_CHUNKS 32768u
+#define SERVICE_WRITE_BUDGET 384u
+#define SERVICE_TX_CHUNK_BUDGET 2u
 
 typedef struct {
     uint32_t magic;
@@ -74,7 +78,8 @@ static Cx4 *s_cx4 = NULL;
 static volatile uint8_t s_shadow[0x2000];
 static volatile uint8_t s_status_proxy = 0;
 static volatile uint8_t s_tx_active = 0;
-static volatile uint32_t s_start_pending = 0;
+static volatile uint32_t s_pending_run = 0;   /* queued $7F4F */
+static volatile uint32_t s_pending_busy = 0;  /* queued $7F47/$7F48 */
 static uint64_t s_virtual_master = 1;
 
 static volatile bool s_armed = false;
@@ -91,7 +96,7 @@ static volatile uint64_t s_reset_vectors = 0;
 /* Single-producer (Core1), single-consumer (Core0) write queue. The queue is
  * deliberately large enough to absorb short bursts while HG51B is executing. */
 typedef struct { uint16_t off; uint8_t data; uint8_t pad; } write_evt_t;
-#define WRITE_Q_N 4096u
+#define WRITE_Q_N 16384u
 #define WRITE_Q_MASK (WRITE_Q_N - 1u)
 static write_evt_t s_write_q[WRITE_Q_N];
 static volatile uint32_t s_write_head = 0; /* producer-owned */
@@ -223,11 +228,14 @@ static inline bool is_status_offset(uint16_t off) {
 static inline uint8_t bus_read(uint16_t off) {
     if (is_status_offset(off)) {
         uint8_t v = __atomic_load_n(&s_status_proxy, __ATOMIC_ACQUIRE);
-        /* A physical start-trigger may already have reached Core1 while Core0
-           is finishing the previous queued operation. Never expose an idle gap
-           between accepted trigger writes. */
-        if (__atomic_load_n(&s_start_pending, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) v |= 0xc0u;
+        /* Preserve the real CX4 distinction:
+           bit 6 = HG51B running, bit 7 = cache/DMA/bus busy.
+           Only synthesize bits for trigger writes that Core1 has physically
+           accepted but Core0 has not applied yet. Never promote RUNNING to
+           BUSY just because our cooperative service still has tx_active=1. */
+        if (__atomic_load_n(&s_pending_run, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&s_pending_busy, __ATOMIC_ACQUIRE)) v |= 0x40u;
+        if (__atomic_load_n(&s_pending_busy, __ATOMIC_ACQUIRE)) v |= 0x80u;
         if (v & 0xc0u) s_tx_busy_reads++;
         return v;
     }
@@ -237,6 +245,13 @@ static inline uint8_t bus_read(uint16_t off) {
 static inline bool is_start_trigger(uint16_t off) {
     return off == 0x7f47u || off == 0x7f48u || off == 0x7f4fu ||
            off == 0x6f47u || off == 0x6f48u || off == 0x6f4fu;
+}
+static inline bool is_busy_trigger(uint16_t off) {
+    return off == 0x7f47u || off == 0x7f48u ||
+           off == 0x6f47u || off == 0x6f48u;
+}
+static inline bool is_run_trigger(uint16_t off) {
+    return off == 0x7f4fu || off == 0x6f4fu;
 }
 
 static inline uint32_t write_q_depth(void) {
@@ -327,7 +342,7 @@ static void transaction_step_budget(uint32_t budget) {
 
     uint8_t st = cx4_read(s_cx4, 0x7f5eu);
     uint32_t used = 0;
-    while ((st & 0xc0u) != 0u && used < budget && s_tx_progress_chunks < TX_MAX_CHUNKS) {
+    while ((st & 0xc0u) != 0u && used < budget) {
         s_virtual_master += TX_MASTER_CHUNK;
         cx4_sync(s_cx4, s_virtual_master);
         s_tx_chunks++;
@@ -341,7 +356,10 @@ static void transaction_step_budget(uint32_t budget) {
         }
     }
 
-    if ((st & 0xc0u) != 0u && !cx4_locked(s_cx4) && s_tx_progress_chunks < TX_MAX_CHUNKS) {
+    if ((st & 0xc0u) != 0u && !cx4_locked(s_cx4)) {
+        /* Do NOT abort a long run.  Real CPU writes may arrive while the HG51B
+           is running; V8.2 keeps draining/applying them on later service calls. */
+        if (s_tx_progress_chunks == TX_LONGRUN_CHUNKS) s_tx_timeout++;
         s_service_tx_budget_hits++;
         return;
     }
@@ -353,14 +371,14 @@ static void transaction_step_budget(uint32_t budget) {
     __atomic_store_n(&s_tx_active, 0u, __ATOMIC_RELEASE);
 
     if ((st & 0xc0u) == 0u) s_tx_done++;
-    else s_tx_timeout++;
 }
 
 static void clear_runtime_state(void) {
     memset((void *)s_shadow, 0, sizeof(s_shadow));
     s_virtual_master = 1;
     __atomic_store_n(&s_tx_active, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&s_start_pending, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pending_run, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pending_busy, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&s_status_proxy, 0u, __ATOMIC_RELEASE);
     s_tx_jobs = s_tx_done = s_tx_timeout = s_tx_chunks = 0;
     s_tx_busy_reads = s_tx_early_arms = s_tx_locked = 0;
@@ -462,9 +480,14 @@ static void __not_in_flash_func(core1_loop)(void) {
                    bus_read() keeps BUSY/RUNNING asserted until Core0 consumes it,
                    so back-to-back $7F48/$7F4F cannot create a false idle gap. */
                 bool queued = write_q_push(off, v);
-                if (queued && is_start_trigger(off)) {
-                    __atomic_fetch_add(&s_start_pending, 1u, __ATOMIC_ACQ_REL);
-                    s_tx_early_arms++;
+                if (queued) {
+                    if (is_busy_trigger(off)) {
+                        __atomic_fetch_add(&s_pending_busy, 1u, __ATOMIC_ACQ_REL);
+                        s_tx_early_arms++;
+                    } else if (is_run_trigger(off)) {
+                        __atomic_fetch_add(&s_pending_run, 1u, __ATOMIC_ACQ_REL);
+                        s_tx_early_arms++;
+                    }
                 }
                 s_cpu_writes++;
                 s_last_write_addr = off;
@@ -523,33 +546,40 @@ void cx4bus_service(void) {
         return;
     }
 
-    /* If the HG51B is running, advance a bounded slice and yield immediately.
-       Writes captured meanwhile remain ordered in the SPSC queue. */
-    if (__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) {
-        transaction_step_budget(SERVICE_TX_CHUNK_BUDGET);
-        s_service_yields++;
-        return;
-    }
-
+    /* V8.2 LIVE INTERLEAVE:
+       CPU-side writes do not stop merely because the HG51B is running.  The
+       upstream core explicitly allows register/DRAM writes while RUNNING; only
+       its own internal busy state decides what those writes do.  V8.1 froze the
+       queue for the whole transaction, which overflowed and destroyed command
+       input. */
     write_evt_t e;
     uint32_t processed = 0;
     while (processed < SERVICE_WRITE_BUDGET && write_q_pop(&e)) {
-        const bool trigger = is_start_trigger(e.off);
         apply_write(e.off, e.data);
         processed++;
 
-        if (trigger) {
-            uint32_t p = __atomic_load_n(&s_start_pending, __ATOMIC_ACQUIRE);
-            if (p) __atomic_fetch_sub(&s_start_pending, 1u, __ATOMIC_ACQ_REL);
+        if (is_busy_trigger(e.off)) {
+            uint32_t p = __atomic_load_n(&s_pending_busy, __ATOMIC_ACQUIRE);
+            if (p) __atomic_fetch_sub(&s_pending_busy, 1u, __ATOMIC_ACQ_REL);
+        } else if (is_run_trigger(e.off)) {
+            uint32_t p = __atomic_load_n(&s_pending_run, __ATOMIC_ACQUIRE);
+            if (p) __atomic_fetch_sub(&s_pending_run, 1u, __ATOMIC_ACQ_REL);
         }
 
-        /* Preserve bus ordering: once a write starts cache/DMA/HG51B work,
-           leave later physical writes queued until that operation reaches idle. */
-        if (__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) break;
+        /* Interleave the DSP with dense CPU traffic instead of letting either
+           side monopolize Core0. */
+        if (__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE) &&
+            ((processed & 31u) == 0u)) {
+            transaction_step_budget(1u);
+        }
     }
 
     if (processed == SERVICE_WRITE_BUDGET && write_q_depth())
         s_service_write_budget_hits++;
+
+    if (__atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE))
+        transaction_step_budget(SERVICE_TX_CHUNK_BUDGET);
+
     s_service_yields++;
 }
 
@@ -575,8 +605,10 @@ void cx4bus_print_runs(void) {
 }
 
 void cx4bus_print_queue(void) {
-    printf("CX4Q depth=%lu pending_start=%lu pushed=%llu popped=%llu dropped=%llu peak=%lu last_phys=%02X last_core=%02X\n",
-           (unsigned long)write_q_depth(),(unsigned long)__atomic_load_n(&s_start_pending,__ATOMIC_ACQUIRE),
+    printf("CX4Q depth=%lu pending_run=%lu pending_busy=%lu pushed=%llu popped=%llu dropped=%llu peak=%lu last_phys=%02X last_core=%02X\n",
+           (unsigned long)write_q_depth(),
+           (unsigned long)__atomic_load_n(&s_pending_run,__ATOMIC_ACQUIRE),
+           (unsigned long)__atomic_load_n(&s_pending_busy,__ATOMIC_ACQUIRE),
            (unsigned long long)s_q_pushed,(unsigned long long)s_q_popped,
            (unsigned long long)s_q_dropped,(unsigned long)s_q_peak,
            s_q_last_phys_cmd,s_q_last_core_cmd);
@@ -588,7 +620,7 @@ void cx4bus_print_queue(void) {
 
 static bool self_run_until_idle(Cx4 *c, uint64_t *master, uint32_t *chunks_out) {
     uint32_t chunks = 0;
-    for (; chunks < TX_MAX_CHUNKS; ++chunks) {
+    for (; chunks < SELF_MAX_CHUNKS; ++chunks) {
         uint8_t st = cx4_read(c, 0x7f5eu);
         if ((st & 0xc0u) == 0u) break;
         *master += TX_MASTER_CHUNK;
@@ -646,8 +678,8 @@ void cx4bus_print_status(void) {
         firmware=cx4_firmware_loaded(s_cx4);
         locked=cx4_locked(s_cx4);
     }
-    printf("CX4STAT mode=SINGLE_SNAPSHOT_LLE_V8_1_COOP armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
-           "q_depth=%lu q_pending=%lu q_push=%llu q_pop=%llu q_drop=%llu q_peak=%lu "
+    printf("CX4STAT mode=SINGLE_SNAPSHOT_LLE_V8_2_LIVE armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+           "q_depth=%lu q_prun=%lu q_pbusy=%lu q_push=%llu q_pop=%llu q_drop=%llu q_peak=%lu "
            "svc=%llu yields=%llu wb_hit=%llu txb_hit=%llu tx_prog=%lu "
            "tx_active=%u tx_jobs=%llu tx_done=%llu tx_to=%llu tx_chunks=%llu tx_busy_reads=%llu tx_early=%llu tx_locked=%llu tx_last=%02X/%02X/%lu "
            "lle_runs=%lu lle_insns=%llu lle_rdrom=%lu lle_distinct=%lu lle_range=%lu-%lu firmware=%d locked=%d master=%llu status=%02X "
@@ -655,7 +687,10 @@ void cx4bus_print_status(void) {
            "cmd_phys=%02X cmd_core=%02X cmd00=%llu/%llu cmdAF=%llu/%llu cmdOther=%llu/%llu cmdIdle=%llu cmdRunning=%llu\n",
            s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_cx4?1u:0u,
            s_rom_slot_valid?1u:0u,(unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
-           (unsigned long)write_q_depth(),(unsigned long)__atomic_load_n(&s_start_pending,__ATOMIC_ACQUIRE),(unsigned long long)s_q_pushed,(unsigned long long)s_q_popped,
+           (unsigned long)write_q_depth(),
+           (unsigned long)__atomic_load_n(&s_pending_run,__ATOMIC_ACQUIRE),
+           (unsigned long)__atomic_load_n(&s_pending_busy,__ATOMIC_ACQUIRE),
+           (unsigned long long)s_q_pushed,(unsigned long long)s_q_popped,
            (unsigned long long)s_q_dropped,(unsigned long)s_q_peak,
            (unsigned long long)s_service_calls,(unsigned long long)s_service_yields,
            (unsigned long long)s_service_write_budget_hits,(unsigned long long)s_service_tx_budget_hits,

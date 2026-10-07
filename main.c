@@ -73,7 +73,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 SINGLE-SNAPSHOT LLE V8.1 COOPERATIVE ===\n");
+    printf("\n=== SNES RP2350B CX4 SINGLE-SNAPSHOT LLE V8.2 LIVE INTERLEAVE ===\n");
     printf("clock=%u kHz | no PIO/DMA write pairing; Core1 captures one coherent A-bus write event per PHI2 cycle\n", GAMEPLAY_CLOCK_KHZ);
     printf("GP41/GP42 unused. Original A-bus only. GP25=A13 must be electrically sound.\n");
     printf("Core1: physical read responder + SPSC write producer; Core0: HG51B LLE consumer.\n\n");
@@ -85,7 +85,7 @@ int main(void) {
 
     cx4bus_init();
     cx4bus_launch_core1();
-    printf("READY SINGLE-SNAPSHOT LLE V8.1 COOPERATIVE. Power/reset SNES with Mega Man X2 selected.\n");
+    printf("READY SINGLE-SNAPSHOT LLE V8.2 LIVE INTERLEAVE. Power/reset SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {
