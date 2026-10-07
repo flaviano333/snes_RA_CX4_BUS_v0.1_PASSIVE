@@ -31,7 +31,7 @@ static void strtoupper_inplace(char *s) {
 }
 
 static void command_info(void) {
-    printf("LASTBUS clock_khz=%u capture=PIO_STATUS42_FINAL\n", GAMEPLAY_CLOCK_KHZ);
+    printf("LASTBUS clock_khz=%u capture=PIO_STATUS42_FINAL_V9_1_FIFO\n", GAMEPLAY_CLOCK_KHZ);
     cx4bus_print_status();
 }
 
@@ -77,7 +77,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 PIO STATUS42 FINAL V9 ===\n");
+    printf("\n=== SNES RP2350B CX4 PIO STATUS42 FINAL V9.1 FIFO ARM ===\n");
     printf("clock=%u kHz | FINAL binary test: PIO drives forced 0x42 on $7F5E from PHI2 rising edge\n", GAMEPLAY_CLOCK_KHZ);
     printf("GP41/GP42 unused. Original A-bus only. GP25=A13 must be electrically sound.\n");
     printf("STAT42 defaults ON. Power/reset the SNES only after READY; use STATTEST for the verdict.\n\n");
@@ -89,7 +89,7 @@ int main(void) {
 
     cx4bus_init();
     cx4bus_launch_core1();
-    printf("READY PIO STATUS42 FINAL V9. STAT42=ON by default. Now power/reset SNES with Mega Man X2 selected.\n");
+    printf("READY PIO STATUS42 FINAL V9.1 FIFO ARM. STAT42=ON by default. Now power/reset SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {

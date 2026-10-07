@@ -12,7 +12,7 @@
 #include "cx4.h"
 
 /*
- * CX4 PIO STATUS42 FINAL V9
+ * CX4 PIO STATUS42 FINAL V9.1 FIFO ARM
  *
  * This build deliberately abandons command-by-command HLE.  Every physical write is captured as one coherent SIO snapshot by Core1 and
  * queued to Core0. This deliberately removes the old two-PIO/two-DMA pairing
@@ -107,7 +107,6 @@ static volatile uint64_t s_read_retarget = 0;
  * owns the electrical timing and drives 0x42 exactly from PHI2 rise to fall.
  * This deliberately avoids the late software responder for the critical test. */
 #define STAT42_VALUE 0x42u
-#define STAT42_PIO_IRQ 0u
 static PIO s_stat_pio = pio0;
 static int s_stat_sm = -1;
 static uint s_stat_prog_off = 0;
@@ -218,7 +217,6 @@ static void stat42_pio_set_pinmux(bool use_pio) {
 static void stat42_pio_prepare(void) {
     if (!s_stat42_pio_ready) return;
     pio_sm_set_enabled(s_stat_pio, (uint)s_stat_sm, false);
-    pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
     pio_sm_clear_fifos(s_stat_pio, (uint)s_stat_sm);
     pio_sm_restart(s_stat_pio, (uint)s_stat_sm);
     pio_sm_clkdiv_restart(s_stat_pio, (uint)s_stat_sm);
@@ -233,7 +231,6 @@ static void stat42_pio_prepare(void) {
 
 static void stat42_pio_disable(void) {
     if (!s_stat42_pio_ready) return;
-    pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
     pio_sm_set_enabled(s_stat_pio, (uint)s_stat_sm, false);
     pio_sm_set_consecutive_pindirs(s_stat_pio, (uint)s_stat_sm, 2u, 9u, false);
     stat42_pio_set_pinmux(false);
@@ -255,7 +252,6 @@ static void stat42_pio_init(void) {
 void cx4bus_status42(bool enabled) {
     s_stat42_mode = enabled;
     s_stat42_saw_read = false;
-    pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
     if (enabled) stat42_pio_prepare();
     else stat42_pio_disable();
 }
@@ -544,8 +540,7 @@ void cx4bus_init(void) {
 void cx4bus_arm(bool enabled) {
     s_armed = enabled && s_rom_slot_valid && s_cx4;
     if (!s_armed) {
-        pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
-        if (!s_stat42_mode) data_release();
+            if (!s_stat42_mode) data_release();
     }
 }
 bool cx4bus_is_armed(void) { return s_armed; }
@@ -580,7 +575,13 @@ static void __not_in_flash_func(core1_loop)(void) {
                 uint16_t o2 = raw_cx4_offset(lo2, hi2);
                 if (o2 != o1 || !is_status_offset(o2)) continue;
                 pre_off = o2;
-                pio_interrupt_set(s_stat_pio, STAT42_PIO_IRQ);
+                /* Arm the PIO with one FIFO token. The SM is blocked on
+                   PULL while PHI2 is low, then owns the exact rising-edge timing. */
+                if (pio_sm_is_tx_fifo_full(s_stat_pio, (uint)s_stat_sm)) {
+                    s_stat42_false_arms++;
+                    continue;
+                }
+                pio_sm_put(s_stat_pio, (uint)s_stat_sm, 1u);
                 stat_armed = true;
                 s_stat42_arms++;
                 break;
