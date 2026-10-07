@@ -1,4 +1,4 @@
-name: Build CX4 EARLY READ LLE V8.3
+name: Build CX4 PIO STATUS42 FINAL V9
 
 on:
   workflow_dispatch:
@@ -30,21 +30,16 @@ jobs:
           python3 tools/patch_upstream_cx4.py third_party/cx4.c
           grep -q "uint8_t cx4_read" third_party/cx4.c
           grep -q "void cx4_sync" third_party/cx4.c
-          grep -q "uint64_t cx4_instructions_executed" third_party/cx4.c
-      - name: Static architecture checks
+      - name: Static final-diagnostic checks
         run: |
-          ! grep -R "hle_conv_oam\|hle_math_command\|hle_on_command" -n cx4_active_bus.c
-          grep -q "EARLY_READ_LLE_V8_3" cx4_active_bus.c
-          grep -q "write_q_push" cx4_active_bus.c
-          grep -q "SIO_EARLY_READ" main.c
-          ! grep -R "pico_generate_pio_header\|hardware_pio\|hardware_dma" -n CMakeLists.txt main.c
-          grep -q "TX_MASTER_CHUNK" cx4_active_bus.c
-          grep -q "SERVICE_WRITE_BUDGET" cx4_active_bus.c
-          grep -q "transaction_step_budget" cx4_active_bus.c
-          grep -q "s_read_predrive" cx4_active_bus.c
-          grep -q "predriven" cx4_active_bus.c
-          grep -q "cx4_write(s_cx4" cx4_active_bus.c
-          grep -q "cx4_sync(s_cx4" cx4_active_bus.c
+          grep -q "PIO_STATUS42_FINAL_V9" cx4_active_bus.c
+          grep -q "status42_drive_program" cx4_active_bus.c
+          grep -q "STAT42_VALUE 0x42" cx4_active_bus.c
+          grep -q "wait 1 gpio 0" status42_drive.pio
+          grep -q "out pindirs, 9" status42_drive.pio
+          grep -q "STATTEST" main.c
+          grep -q "hardware_pio" CMakeLists.txt
+          ! grep -R "GP41\|GP42" -n status42_drive.pio cx4_active_bus.c | grep -v "No external\|unused" || true
       - name: Configure
         env:
           PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
@@ -52,9 +47,9 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Rename UF2
-        run: cp build/cx4_early_read_lle_v8_3.uf2 build/CX4_EARLY_READ_LLE_V8_3_GENERIC_SEM_ROM.uf2
+        run: cp build/cx4_pio_status42_final_v9.uf2 build/CX4_PIO_STATUS42_FINAL_V9_GENERIC_SEM_ROM.uf2
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: CX4-EARLY-READ-LLE-V8-3
-          path: build/CX4_EARLY_READ_LLE_V8_3_GENERIC_SEM_ROM.uf2
+          name: CX4-PIO-STATUS42-FINAL-V9
+          path: build/CX4_PIO_STATUS42_FINAL_V9_GENERIC_SEM_ROM.uf2

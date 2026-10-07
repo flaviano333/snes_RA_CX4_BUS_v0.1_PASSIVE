@@ -1,0 +1,35 @@
+.pio_version 1
+.program status42_drive
+; FINAL diagnostic responder for $7F5E.
+;
+; CPU/Core1 pre-arms IRQ0 only when the address bus is already stable at
+; $xx7F5E during PHI2-low.  From that point the PIO owns the critical timing:
+; it drives constant 0x42 immediately on the PHI2 rising edge and releases
+; DATA immediately on the falling edge.
+;
+; out_base = GP2, count = 9.  The 9-bit packed bus has a zero hole at GP5:
+;   bit0..2 -> GP2..4 (D0..D2)
+;   bit3    -> GP5 (unused/broken, pad remains SIO input)
+;   bit4..8 -> GP6..10 (D3..D7)
+;
+; Startup FIFO words:
+;   1) X = packed constant 0x42 = 0x082
+;   2) Y = pindir mask excluding GP5 = 0x1F7
+
+    pull block
+    mov x, osr
+    pull block
+    mov y, osr
+
+.wrap_target
+    wait 1 irq 0           ; armed by Core1 while PHI2 is still low
+    wait 1 gpio 0          ; PHI2 rising edge
+    mov osr, x
+    out pins, 9            ; preload physical DATA values
+    mov osr, y
+    out pindirs, 9         ; enable only D0..D7 pads (GP5 bit is 0)
+    wait 0 gpio 0          ; hold through the complete high phase
+    mov osr, null
+    out pindirs, 9         ; DATA Hi-Z immediately at PHI2 falling edge
+    irq clear 0
+.wrap

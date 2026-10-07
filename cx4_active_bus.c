@@ -6,11 +6,13 @@
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/sio.h"
+#include "hardware/pio.h"
+#include "status42_drive.pio.h"
 #include "hardware/regs/addressmap.h"
 #include "cx4.h"
 
 /*
- * CX4 EARLY-READ LLE V8.3
+ * CX4 PIO STATUS42 FINAL V9
  *
  * This build deliberately abandons command-by-command HLE.  Every physical write is captured as one coherent SIO snapshot by Core1 and
  * queued to Core0. This deliberately removes the old two-PIO/two-DMA pairing
@@ -100,6 +102,26 @@ static volatile uint64_t s_read_predrive = 0;
 static volatile uint64_t s_read_late = 0;
 static volatile uint64_t s_read_retarget = 0;
 
+/* FINAL binary read-path diagnostic.
+ * Core1 only decides that the address is $xx7F5E while PHI2 is LOW.  PIO0 then
+ * owns the electrical timing and drives 0x42 exactly from PHI2 rise to fall.
+ * This deliberately avoids the late software responder for the critical test. */
+#define STAT42_VALUE 0x42u
+#define STAT42_PIO_IRQ 0u
+static PIO s_stat_pio = pio0;
+static int s_stat_sm = -1;
+static uint s_stat_prog_off = 0;
+static volatile bool s_stat42_mode = true;
+static volatile bool s_stat42_pio_ready = false;
+static volatile uint64_t s_stat42_arms = 0;
+static volatile uint64_t s_stat42_forced_reads = 0;
+static volatile uint64_t s_stat42_false_arms = 0;
+static volatile uint64_t s_stat42_pin_ok = 0;
+static volatile uint64_t s_stat42_pin_bad = 0;
+static volatile uint8_t s_stat42_pin_last = 0xffu;
+static volatile uint64_t s_stat42_cmd_after = 0;
+static volatile bool s_stat42_saw_read = false;
+
 /* Single-producer (Core1), single-consumer (Core0) write queue. The queue is
  * deliberately large enough to absorb short bursts while HG51B is executing. */
 typedef struct { uint16_t off; uint8_t data; uint8_t pad; } write_evt_t;
@@ -175,6 +197,94 @@ static inline void data_drive(uint8_t v) {
     gpio_put_masked(DATA_MASK, packed_data(v));
     gpio_set_dir_out_masked(DATA_MASK);
     s_driving = true;
+}
+
+
+static void stat42_pio_set_pinmux(bool use_pio) {
+    const uint pins[8] = {2,3,4,6,7,8,9,10};
+    for (unsigned i=0;i<8;i++) {
+        gpio_set_function(pins[i], use_pio ? GPIO_FUNC_PIO0 : GPIO_FUNC_SIO);
+        if (!use_pio) {
+            gpio_set_dir(pins[i], GPIO_IN);
+            gpio_disable_pulls(pins[i]);
+        }
+    }
+    /* GP5 is intentionally never muxed to PIO. */
+    gpio_set_function(5u, GPIO_FUNC_SIO);
+    gpio_set_dir(5u, GPIO_IN);
+    gpio_disable_pulls(5u);
+}
+
+static void stat42_pio_prepare(void) {
+    if (!s_stat42_pio_ready) return;
+    pio_sm_set_enabled(s_stat_pio, (uint)s_stat_sm, false);
+    pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
+    pio_sm_clear_fifos(s_stat_pio, (uint)s_stat_sm);
+    pio_sm_restart(s_stat_pio, (uint)s_stat_sm);
+    pio_sm_clkdiv_restart(s_stat_pio, (uint)s_stat_sm);
+    pio_sm_set_consecutive_pindirs(s_stat_pio, (uint)s_stat_sm, 2u, 9u, false);
+    stat42_pio_set_pinmux(true);
+    /* Relative GP2..GP10 packed form of D=0x42, with GP5 hole at bit3. */
+    pio_sm_put_blocking(s_stat_pio, (uint)s_stat_sm, 0x082u);
+    /* Direction mask for GP2..GP10 excluding GP5 (relative bit3). */
+    pio_sm_put_blocking(s_stat_pio, (uint)s_stat_sm, 0x1f7u);
+    pio_sm_set_enabled(s_stat_pio, (uint)s_stat_sm, true);
+}
+
+static void stat42_pio_disable(void) {
+    if (!s_stat42_pio_ready) return;
+    pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
+    pio_sm_set_enabled(s_stat_pio, (uint)s_stat_sm, false);
+    pio_sm_set_consecutive_pindirs(s_stat_pio, (uint)s_stat_sm, 2u, 9u, false);
+    stat42_pio_set_pinmux(false);
+    data_release();
+}
+
+static void stat42_pio_init(void) {
+    s_stat_prog_off = pio_add_program(s_stat_pio, &status42_drive_program);
+    s_stat_sm = pio_claim_unused_sm(s_stat_pio, true);
+    pio_sm_config c = status42_drive_program_get_default_config(s_stat_prog_off);
+    sm_config_set_out_pins(&c, 2u, 9u);
+    sm_config_set_out_shift(&c, true, false, 32u);
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(s_stat_pio, (uint)s_stat_sm, s_stat_prog_off, &c);
+    s_stat42_pio_ready = true;
+    stat42_pio_prepare();
+}
+
+void cx4bus_status42(bool enabled) {
+    s_stat42_mode = enabled;
+    s_stat42_saw_read = false;
+    pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
+    if (enabled) stat42_pio_prepare();
+    else stat42_pio_disable();
+}
+
+void cx4bus_status42_clear(void) {
+    s_stat42_arms = s_stat42_forced_reads = s_stat42_false_arms = 0;
+    s_stat42_pin_ok = s_stat42_pin_bad = 0;
+    s_stat42_pin_last = 0xffu;
+    s_stat42_cmd_after = 0;
+    s_stat42_saw_read = false;
+}
+
+void cx4bus_print_status42(void) {
+    const char *verdict = "WAIT";
+    if (!s_stat42_mode) verdict = "OFF";
+    else if (s_stat42_arms == 0 || s_stat42_forced_reads == 0) verdict = "FAIL_NO_STATUS_ARM";
+    else if (s_stat42_pin_bad && !s_stat42_pin_ok) verdict = "FAIL_DATA_DRIVE";
+    else if (s_stat42_forced_reads >= 4 && s_stat42_cmd_after <= 1) verdict = "PASS_CPU_WAITED";
+    else if (s_stat42_forced_reads >= 4 && s_stat42_cmd_after >= 8) verdict = "FAIL_CPU_CONTINUED";
+    printf("STAT42 mode=%s pio=%u arms=%llu reads=%llu false=%llu pin_ok=%llu pin_bad=%llu pin_last=%02X cmd_after=%llu verdict=%s\n",
+           s_stat42_mode?"ON":"OFF", s_stat42_pio_ready?1u:0u,
+           (unsigned long long)s_stat42_arms,
+           (unsigned long long)s_stat42_forced_reads,
+           (unsigned long long)s_stat42_false_arms,
+           (unsigned long long)s_stat42_pin_ok,
+           (unsigned long long)s_stat42_pin_bad,
+           s_stat42_pin_last,
+           (unsigned long long)s_stat42_cmd_after,
+           verdict);
 }
 
 static inline bool raw_is_cx4(uint32_t lo, uint32_t hi) {
@@ -427,72 +537,56 @@ void cx4bus_init(void) {
         gpio_disable_pulls(pins[i]);
     }
     data_release();
+    stat42_pio_init();
+    s_stat42_mode = true;
 }
 
 void cx4bus_arm(bool enabled) {
     s_armed = enabled && s_rom_slot_valid && s_cx4;
-    if (!s_armed) data_release();
+    if (!s_armed) {
+        pio_interrupt_clear(s_stat_pio, STAT42_PIO_IRQ);
+        if (!s_stat42_mode) data_release();
+    }
 }
 bool cx4bus_is_armed(void) { return s_armed; }
 void cx4bus_reset_state(void) { s_reset_requested = true; }
 
 static void __not_in_flash_func(core1_loop)(void) {
     s_core1_started = true;
-    data_release();
+    if (!s_stat42_mode) data_release();
 
     for (;;) {
-        /* Wait for the beginning of PHI2-low.  Unlike V8.2, reads are decoded
-           during LOW so DATA can already be valid BEFORE PHI2 rises. */
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
 
-        bool predriven = false;
+        bool stat_armed = false;
         uint16_t pre_off = 0;
-        uint8_t pre_v = 0;
 
-        /* Address/control lines can move immediately after PHI2 falls.  Require
-           two consecutive coherent snapshots of the same CX4 read before
-           enabling DATA outputs.  DATA bits themselves are deliberately not
-           part of the stability test. */
-        for (;;) {
-            uint32_t lo1 = sio_hw->gpio_in;
-            uint32_t hi1 = sio_hw->gpio_hi_in;
-            if (lo1 & PHI2_MASK) break;
-
-            const bool rd1 = (hi1 & RD_HI_MASK) == 0u;
-            const bool ctrl1 = rd1 &&
-                ((lo1 & WR_MASK) != 0u) &&
-                ((hi1 & ROMSEL_HI_MASK) != 0u) &&
-                ((hi1 & WRAMSEL_HI_MASK) != 0u) &&
-                raw_is_cx4(lo1, hi1);
-            if (!ctrl1) continue;
-
-            uint16_t off1 = raw_cx4_offset(lo1, hi1);
-            __asm volatile("nop; nop;" ::: "memory");
-            uint32_t lo2 = sio_hw->gpio_in;
-            uint32_t hi2 = sio_hw->gpio_hi_in;
-            if (lo2 & PHI2_MASK) break;
-
-            const bool rd2 = (hi2 & RD_HI_MASK) == 0u;
-            const bool ctrl2 = rd2 &&
-                ((lo2 & WR_MASK) != 0u) &&
-                ((hi2 & ROMSEL_HI_MASK) != 0u) &&
-                ((hi2 & WRAMSEL_HI_MASK) != 0u) &&
-                raw_is_cx4(lo2, hi2);
-            if (!ctrl2) continue;
-
-            uint16_t off2 = raw_cx4_offset(lo2, hi2);
-            if (off1 != off2) continue;
-
-            pre_off = off2;
-            pre_v = bus_read(pre_off);
-            if (s_armed) data_drive(pre_v);
-            predriven = true;
-            s_read_predrive++;
-            break;
+        /* FINAL TEST: do NOT wait for /RD or /ROMSEL during PHI2-low.  Those
+           strobes were the reason V8.3 never pre-drove.  We only require the
+           full CX4 address to be stable twice and /WR high.  PIO then waits for
+           the PHI2 rising edge and drives 0x42 in hardware. */
+        if (s_stat42_mode && s_armed && s_stat42_pio_ready) {
+            while (!(sio_hw->gpio_in & PHI2_MASK)) {
+                uint32_t lo1 = sio_hw->gpio_in;
+                uint32_t hi1 = sio_hw->gpio_hi_in;
+                if ((lo1 & WR_MASK) == 0u || !raw_is_cx4(lo1, hi1)) continue;
+                uint16_t o1 = raw_cx4_offset(lo1, hi1);
+                if (!is_status_offset(o1)) continue;
+                __asm volatile("nop; nop;" ::: "memory");
+                uint32_t lo2 = sio_hw->gpio_in;
+                uint32_t hi2 = sio_hw->gpio_hi_in;
+                if (lo2 & PHI2_MASK) break;
+                if ((lo2 & WR_MASK) == 0u || !raw_is_cx4(lo2, hi2)) continue;
+                uint16_t o2 = raw_cx4_offset(lo2, hi2);
+                if (o2 != o1 || !is_status_offset(o2)) continue;
+                pre_off = o2;
+                pio_interrupt_set(s_stat_pio, STAT42_PIO_IRQ);
+                stat_armed = true;
+                s_stat42_arms++;
+                break;
+            }
         }
 
-        /* Rising edge: writes are sampled here as before.  For a read, this is
-           only a validation/fallback point; the normal path is already driving. */
         while (!(sio_hw->gpio_in & PHI2_MASK)) tight_loop_contents();
         __asm volatile("nop; nop;" ::: "memory");
         uint32_t lo = sio_hw->gpio_in;
@@ -509,31 +603,36 @@ static void __not_in_flash_func(core1_loop)(void) {
 
             if (ctrl_ok) {
                 uint16_t off = raw_cx4_offset(lo, hi);
-                uint8_t v;
-                if (predriven && off == pre_off) {
-                    v = pre_v;
-                } else {
-                    /* If the LOW-phase address changed underneath us, retarget
-                       immediately.  This is diagnostic: the desired path is
-                       predrive, not this late fallback. */
-                    if (predriven) {
-                        if (s_driving) data_release();
-                        s_read_retarget++;
-                    }
-                    v = bus_read(off);
-                    if (s_armed) data_drive(v);
+                if (s_stat42_mode && stat_armed && is_status_offset(off) && off == pre_off) {
+                    /* PIO is already driving 0x42 from the exact rising edge. */
+                    __asm volatile("nop; nop; nop; nop;" ::: "memory");
+                    uint8_t observed = raw_data(sio_hw->gpio_in);
+                    s_stat42_pin_last = observed;
+                    if (observed == STAT42_VALUE) s_stat42_pin_ok++;
+                    else s_stat42_pin_bad++;
+                    s_stat42_forced_reads++;
+                    s_stat42_saw_read = true;
+                    s_cpu_reads++;
+                    s_driven_reads++;
+                    s_last_read_addr = off;
+                    s_last_read_data = STAT42_VALUE;
+                    trace_io('R', off, STAT42_VALUE);
+                } else if (!s_stat42_mode) {
+                    uint8_t v = bus_read(off);
+                    if (s_armed) { data_drive(v); s_driven_reads++; }
+                    s_cpu_reads++;
+                    s_last_read_addr = off;
+                    s_last_read_data = v;
+                    trace_io('R', off, v);
                     s_read_late++;
+                } else {
+                    /* Diagnostic mode intentionally leaves non-status reads Hi-Z. */
+                    s_cpu_reads++;
+                    s_last_read_addr = off;
+                    s_last_read_data = bus_read(off);
                 }
-                s_cpu_reads++;
-                s_last_read_addr = off;
-                s_last_read_data = v;
-                trace_io('R', off, v);
             } else {
-                if (predriven) {
-                    /* A speculative LOW-phase decode did not survive to PHI2-high. */
-                    if (s_driving) data_release();
-                    s_read_retarget++;
-                }
+                if (stat_armed) s_stat42_false_arms++;
                 uint32_t a = raw_address24(lo, hi);
                 if (a == 0x00fffcu) s_reset_arm = 8;
                 else if (a == 0x00fffdu && s_reset_arm) {
@@ -542,15 +641,14 @@ static void __not_in_flash_func(core1_loop)(void) {
             }
 
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
-            if (s_driving) data_release();
+            if (!s_stat42_mode && s_driving) data_release();
+            /* PIO releases its own output at this same falling edge. */
             continue;
         }
 
-        /* If this became a write/non-read after a speculative decode, never
-           leave our DATA drivers enabled. */
-        if (predriven && s_driving) {
-            data_release();
-            s_read_retarget++;
+        if (stat_armed) {
+            /* Stable status address turned out not to be a qualified read. */
+            s_stat42_false_arms++;
         }
 
         if (wr && raw_is_cx4(lo, hi)) {
@@ -573,12 +671,13 @@ static void __not_in_flash_func(core1_loop)(void) {
                         s_tx_early_arms++;
                     }
                 }
+                if ((off == 0x7f4fu || off == 0x6f4fu) && s_stat42_mode && s_stat42_saw_read)
+                    s_stat42_cmd_after++;
                 s_cpu_writes++;
                 s_last_write_addr = off;
                 s_last_write_data = v;
                 trace_io('W', off, v);
             }
-
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
             continue;
         }
@@ -716,6 +815,7 @@ static bool self_run_until_idle(Cx4 *c, uint64_t *master, uint32_t *chunks_out) 
     }
     if (chunks_out) *chunks_out = chunks;
     return (cx4_read(c,0x7f5eu) & 0xc0u) == 0u;
+    cx4bus_print_status42();
 }
 
 void cx4bus_selfcheck(void) {
@@ -765,7 +865,7 @@ void cx4bus_print_status(void) {
         firmware=cx4_firmware_loaded(s_cx4);
         locked=cx4_locked(s_cx4);
     }
-    printf("CX4STAT mode=EARLY_READ_LLE_V8_3 armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+    printf("CX4STAT mode=PIO_STATUS42_FINAL_V9 armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
            "q_depth=%lu q_prun=%lu q_pbusy=%lu q_push=%llu q_pop=%llu q_drop=%llu q_peak=%lu "
            "svc=%llu yields=%llu wb_hit=%llu txb_hit=%llu tx_prog=%lu "
            "tx_active=%u tx_jobs=%llu tx_done=%llu tx_to=%llu tx_chunks=%llu tx_busy_reads=%llu tx_early=%llu tx_locked=%llu tx_last=%02X/%02X/%lu "

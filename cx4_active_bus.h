@@ -13,4 +13,7 @@ void cx4bus_print_trace(void);
 void cx4bus_print_runs(void);
 void cx4bus_print_queue(void);
 void cx4bus_selfcheck(void);
+void cx4bus_status42(bool enabled);
+void cx4bus_status42_clear(void);
+void cx4bus_print_status42(void);
 #endif
