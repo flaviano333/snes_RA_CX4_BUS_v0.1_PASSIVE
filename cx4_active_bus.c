@@ -10,16 +10,16 @@
 #include "cx4.h"
 
 /*
- * CX4 LLE TRANSACTIONAL V7.1 BUSMAP
+ * CX4 SINGLE-SNAPSHOT LLE V8
  *
- * This build deliberately abandons command-by-command HLE.  Every physical
- * write to the Cx4 window is fed to the instruction-level HG51B core.  If that
- * write starts internal work, Core0 advances the real core against a synthetic
- * SNES-master-clock timeline until the Cx4 reports idle again.  While it is
- * running, Core1 continues to answer the SNES CPU's status polls immediately.
+ * This build deliberately abandons command-by-command HLE.  Every physical write is captured as one coherent SIO snapshot by Core1 and
+ * queued to Core0. This deliberately removes the old two-PIO/two-DMA pairing
+ * path, which could pair the right address with the wrong data. Core0 feeds the
+ * queued write into the instruction-level HG51B core and advances a synthetic
+ * master timeline until the real Cx4 state reports idle.
  *
- * No external SYSTEM CLK and no /RESET wire are used.  The proven V4 A-bus
- * capture/responder stays intact; only the Cx4 state engine is replaced.
+ * No external SYSTEM CLK and no /RESET wire are used. Core1 remains the physical
+ * read responder and the sole write-event producer; Core0 is the sole Cx4 owner.
  */
 
 #define PIN_PHI2     0u
@@ -72,6 +72,7 @@ static Cx4 *s_cx4 = NULL;
 static volatile uint8_t s_shadow[0x2000];
 static volatile uint8_t s_status_proxy = 0;
 static volatile uint8_t s_tx_active = 0;
+static volatile uint32_t s_start_pending = 0;
 static uint64_t s_virtual_master = 1;
 
 static volatile bool s_armed = false;
@@ -83,20 +84,31 @@ static volatile uint8_t s_reset_arm = 0;
 static volatile uint64_t s_cpu_reads = 0;
 static volatile uint64_t s_cpu_writes = 0;
 static volatile uint64_t s_driven_reads = 0;
-static volatile uint64_t s_pio_writes = 0;
-static volatile uint64_t s_pio_ram_writes = 0;
-static volatile uint64_t s_pio_io_writes = 0;
 static volatile uint64_t s_reset_vectors = 0;
+
+/* Single-producer (Core1), single-consumer (Core0) write queue. The queue is
+ * deliberately large enough to absorb short bursts while HG51B is executing. */
+typedef struct { uint16_t off; uint8_t data; uint8_t pad; } write_evt_t;
+#define WRITE_Q_N 4096u
+#define WRITE_Q_MASK (WRITE_Q_N - 1u)
+static write_evt_t s_write_q[WRITE_Q_N];
+static volatile uint32_t s_write_head = 0; /* producer-owned */
+static volatile uint32_t s_write_tail = 0; /* consumer-owned */
+static volatile uint64_t s_q_pushed = 0;
+static volatile uint64_t s_q_popped = 0;
+static volatile uint64_t s_q_dropped = 0;
+static volatile uint32_t s_q_peak = 0;
+static volatile uint8_t s_q_last_phys_cmd = 0xffu;
+static volatile uint8_t s_q_last_core_cmd = 0xffu;
+static volatile uint64_t s_cmd_phys_00 = 0, s_cmd_phys_af = 0, s_cmd_phys_other = 0;
+static volatile uint64_t s_cmd_core_00 = 0, s_cmd_core_af = 0, s_cmd_core_other = 0;
+static volatile uint64_t s_cmd_core_idle = 0, s_cmd_core_running = 0;
+
 static volatile uint64_t s_state_resets = 0;
 static volatile uint32_t s_last_read_addr = 0;
 static volatile uint32_t s_last_write_addr = 0;
 static volatile uint8_t s_last_read_data = 0;
 static volatile uint8_t s_last_write_data = 0;
-
-/* Optional software repair for constant address bits used by the Cx4 decode.
- * This lets us compensate for one bad/misread address line without rewiring. */
-static volatile uint32_t s_addr_force_mask = 0u;
-static volatile uint32_t s_addr_force_value = 0u;
 
 static volatile uint64_t s_tx_jobs = 0;
 static volatile uint64_t s_tx_done = 0;
@@ -146,22 +158,11 @@ static inline void data_drive(uint8_t v) {
     s_driving = true;
 }
 
-static inline bool addr_bit_fixed(uint32_t bit, bool raw) {
-    uint32_t m = 1u << bit;
-    if (__atomic_load_n(&s_addr_force_mask, __ATOMIC_RELAXED) & m)
-        return (__atomic_load_n(&s_addr_force_value, __ATOMIC_RELAXED) & m) != 0u;
-    return raw;
-}
-
 static inline bool raw_is_cx4(uint32_t lo, uint32_t hi) {
-    bool a22 = addr_bit_fixed(22u, (hi & A22_HI_MASK) != 0u);
-    bool a15 = addr_bit_fixed(15u, (lo & A15_MASK) != 0u);
-    bool a14 = addr_bit_fixed(14u, (lo & A14_MASK) != 0u);
-    bool a13 = addr_bit_fixed(13u, (lo & A13_MASK) != 0u);
-    if (a22) return false;   /* banks 40-7F/C0-FF excluded */
-    if (a15) return false;
-    if (!a14) return false;
-    if (!a13) return false;
+    if (hi & A22_HI_MASK) return false;  /* banks 40-7F/C0-FF excluded */
+    if (lo & A15_MASK) return false;
+    if (!(lo & A14_MASK)) return false;
+    if (!(lo & A13_MASK)) return false;
     return true;
 }
 static inline uint16_t raw_cx4_offset(uint32_t lo, uint32_t hi) {
@@ -215,10 +216,57 @@ static inline bool is_status_offset(uint16_t off) {
 static inline uint8_t bus_read(uint16_t off) {
     if (is_status_offset(off)) {
         uint8_t v = __atomic_load_n(&s_status_proxy, __ATOMIC_ACQUIRE);
+        /* A physical start-trigger may already have reached Core1 while Core0
+           is finishing the previous queued operation. Never expose an idle gap
+           between accepted trigger writes. */
+        if (__atomic_load_n(&s_start_pending, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&s_tx_active, __ATOMIC_ACQUIRE)) v |= 0xc0u;
         if (v & 0xc0u) s_tx_busy_reads++;
         return v;
     }
     return s_shadow[(off - 0x6000u) & 0x1fffu];
+}
+
+static inline bool is_start_trigger(uint16_t off) {
+    return off == 0x7f47u || off == 0x7f48u || off == 0x7f4fu ||
+           off == 0x6f47u || off == 0x6f48u || off == 0x6f4fu;
+}
+
+static inline uint32_t write_q_depth(void) {
+    uint32_t h = __atomic_load_n(&s_write_head, __ATOMIC_ACQUIRE);
+    uint32_t t = __atomic_load_n(&s_write_tail, __ATOMIC_ACQUIRE);
+    return h - t;
+}
+
+static inline bool write_q_push(uint16_t off, uint8_t data) {
+    uint32_t h = __atomic_load_n(&s_write_head, __ATOMIC_RELAXED);
+    uint32_t t = __atomic_load_n(&s_write_tail, __ATOMIC_ACQUIRE);
+    if ((h - t) >= WRITE_Q_N) { s_q_dropped++; return false; }
+    s_write_q[h & WRITE_Q_MASK].off = off;
+    s_write_q[h & WRITE_Q_MASK].data = data;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_write_head, h + 1u, __ATOMIC_RELEASE);
+    s_q_pushed++;
+    uint32_t depth = (h + 1u) - t;
+    if (depth > s_q_peak) s_q_peak = depth;
+    if (off == 0x7f4fu) {
+        s_q_last_phys_cmd = data;
+        if (data == 0x00u) s_cmd_phys_00++;
+        else if (data == 0xafu) s_cmd_phys_af++;
+        else s_cmd_phys_other++;
+    }
+    return true;
+}
+
+static inline bool write_q_pop(write_evt_t *e) {
+    uint32_t t = __atomic_load_n(&s_write_tail, __ATOMIC_RELAXED);
+    uint32_t h = __atomic_load_n(&s_write_head, __ATOMIC_ACQUIRE);
+    if (t == h) return false;
+    *e = s_write_q[t & WRITE_Q_MASK];
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    __atomic_store_n(&s_write_tail, t + 1u, __ATOMIC_RELEASE);
+    s_q_popped++;
+    return true;
 }
 
 static inline void trace_io(uint8_t op, uint16_t off, uint8_t data) {
@@ -290,6 +338,7 @@ static void clear_runtime_state(void) {
     memset((void *)s_shadow, 0, sizeof(s_shadow));
     s_virtual_master = 1;
     __atomic_store_n(&s_tx_active, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_start_pending, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&s_status_proxy, 0u, __ATOMIC_RELEASE);
     s_tx_jobs = s_tx_done = s_tx_timeout = s_tx_chunks = 0;
     s_tx_busy_reads = s_tx_early_arms = s_tx_locked = 0;
@@ -297,6 +346,9 @@ static void clear_runtime_state(void) {
     s_tx_last_status = 0;
     s_tx_last_chunks = 0;
     s_trace_seq = 0;
+    /* Flush any physical writes that belonged to the pre-reset machine state. */
+    uint32_t h = __atomic_load_n(&s_write_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&s_write_tail, h, __ATOMIC_RELEASE);
     if (s_cx4) {
         cx4_reset(s_cx4);
         mirror_refresh_all();
@@ -375,38 +427,31 @@ static void __not_in_flash_func(core1_loop)(void) {
                 ((hi & ROMSEL_HI_MASK) != 0u) &&
                 ((hi & WRAMSEL_HI_MASK) != 0u);
 
-            /* PIO+DMA remains authoritative for the byte itself, but this early
-               arm closes the race between the physical $7F4F write and Core0
-               seeing that sample. */
-            if (ctrl_ok_w && off == 0x7f4fu) {
-                __atomic_store_n(&s_status_proxy, 0xc0u, __ATOMIC_RELEASE);
-                s_tx_early_arms++;
-            }
-
+            /* Sample the data from the SAME physical bus cycle whose address was
+               decoded above. This one event is now authoritative; no PIO pairing. */
             __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
             uint8_t v = raw_data(sio_hw->gpio_in);
+
+            if (ctrl_ok_w) {
+                /* Queue first, then expose the accepted trigger as pending.
+                   bus_read() keeps BUSY/RUNNING asserted until Core0 consumes it,
+                   so back-to-back $7F48/$7F4F cannot create a false idle gap. */
+                bool queued = write_q_push(off, v);
+                if (queued && is_start_trigger(off)) {
+                    __atomic_fetch_add(&s_start_pending, 1u, __ATOMIC_ACQ_REL);
+                    s_tx_early_arms++;
+                }
+                s_cpu_writes++;
+                s_last_write_addr = off;
+                s_last_write_data = v;
+                trace_io('W', off, v);
+            }
+
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
-            s_cpu_writes++; s_last_write_addr = off; s_last_write_data = v;
-            trace_io('W', off, v);
             continue;
         }
         while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
     }
-}
-
-void cx4bus_set_addr_fix(uint32_t mask, uint32_t value) {
-    /* Only these bits are meaningful to the Cx4 coarse decode. */
-    const uint32_t allowed = (1u<<13) | (1u<<14) | (1u<<15) | (1u<<22);
-    mask &= allowed;
-    value &= allowed;
-    __atomic_store_n(&s_addr_force_value, value, __ATOMIC_RELEASE);
-    __atomic_store_n(&s_addr_force_mask, mask, __ATOMIC_RELEASE);
-    data_release();
-}
-
-void cx4bus_get_addr_fix(uint32_t *mask, uint32_t *value) {
-    if (mask) *mask = __atomic_load_n(&s_addr_force_mask, __ATOMIC_ACQUIRE);
-    if (value) *value = __atomic_load_n(&s_addr_force_value, __ATOMIC_ACQUIRE);
 }
 
 void cx4bus_launch_core1(void) {
@@ -415,42 +460,49 @@ void cx4bus_launch_core1(void) {
     while (!s_core1_started) tight_loop_contents();
 }
 
-void cx4bus_pio_write(uint32_t address, uint8_t data) {
-    uint32_t fm = __atomic_load_n(&s_addr_force_mask, __ATOMIC_ACQUIRE);
-    uint32_t fv = __atomic_load_n(&s_addr_force_value, __ATOMIC_ACQUIRE);
-    address = (address & ~fm) | (fv & fm);
-    uint8_t bank = (uint8_t)(address >> 16);
-    uint16_t off = (uint16_t)address;
-    if (!cx4_bank(bank) || off < 0x6000u || off > 0x7fffu) return;
+static void apply_write(uint16_t off, uint8_t data) {
     if (!s_cx4) return;
 
-    s_pio_writes++;
     uint16_t c = canonical_off(off);
-    if (c >= 0x6000u && c <= 0x6bffu) s_pio_ram_writes++;
-    else s_pio_io_writes++;
 
-    /* Keep the CPU-visible mirror immediately coherent with the write, then
-       feed the exact same write into the instruction-level core. */
+    /* Record whether a physical entry-PC write reached Core0 while the actual
+       HG51B was idle or already running. This directly diagnoses lost/mutated
+       $7F4F bytes without guessing from the picture. */
+    if (off == 0x7f4fu || off == 0x6f4fu) {
+        uint8_t pre = cx4_read(s_cx4, 0x7f5eu);
+        s_q_last_core_cmd = data;
+        if (data == 0x00u) s_cmd_core_00++;
+        else if (data == 0xafu) s_cmd_core_af++;
+        else s_cmd_core_other++;
+        if (pre & 0x40u) s_cmd_core_running++;
+        else s_cmd_core_idle++;
+        s_tx_last_entry = data;
+    }
+
     shadow_store(off, data);
     cx4_write(s_cx4, off, data);
 
-    if (off == 0x7f4fu || off == 0x6f4fu) s_tx_last_entry = data;
-
-    /* Any write may legally start cache fill, DMA, or program execution.
-       Inspect the real status rather than maintaining a list of pseudo commands. */
+    /* Any write may legally start cache fill, DMA, or program execution. */
     uint8_t st = cx4_read(s_cx4, 0x7f5eu);
     __atomic_store_n(&s_status_proxy, st, __ATOMIC_RELEASE);
     if (st & 0xc0u) (void)transaction_run_until_idle();
-    else if (c >= 0x6c00u) {
-        /* IO register read-back can differ from the raw byte written. */
-        shadow_store(c, cx4_read(s_cx4, c));
-    }
+    else if (c >= 0x6c00u) shadow_store(c, cx4_read(s_cx4, c));
 }
 
 void cx4bus_service(void) {
     if (s_reset_requested) {
         s_reset_requested = false;
         clear_runtime_state();
+    }
+
+    write_evt_t e;
+    while (write_q_pop(&e)) {
+        const bool trigger = is_start_trigger(e.off);
+        apply_write(e.off, e.data);
+        if (trigger) {
+            uint32_t p = __atomic_load_n(&s_start_pending, __ATOMIC_ACQUIRE);
+            if (p) __atomic_fetch_sub(&s_start_pending, 1u, __ATOMIC_ACQ_REL);
+        }
     }
 }
 
@@ -473,6 +525,18 @@ void cx4bus_print_runs(void) {
         printf("  seq=%lu base=%06lX pb=%04X pc=%02X\n",
                (unsigned long)ring[i].seq, (unsigned long)ring[i].base,
                ring[i].pb, ring[i].pc);
+}
+
+void cx4bus_print_queue(void) {
+    printf("CX4Q depth=%lu pending_start=%lu pushed=%llu popped=%llu dropped=%llu peak=%lu last_phys=%02X last_core=%02X\n",
+           (unsigned long)write_q_depth(),(unsigned long)__atomic_load_n(&s_start_pending,__ATOMIC_ACQUIRE),
+           (unsigned long long)s_q_pushed,(unsigned long long)s_q_popped,
+           (unsigned long long)s_q_dropped,(unsigned long)s_q_peak,
+           s_q_last_phys_cmd,s_q_last_core_cmd);
+    printf("CX4Q cmd_phys 00=%llu AF=%llu other=%llu | cmd_core 00=%llu AF=%llu other=%llu idle=%llu running=%llu\n",
+           (unsigned long long)s_cmd_phys_00,(unsigned long long)s_cmd_phys_af,(unsigned long long)s_cmd_phys_other,
+           (unsigned long long)s_cmd_core_00,(unsigned long long)s_cmd_core_af,(unsigned long long)s_cmd_core_other,
+           (unsigned long long)s_cmd_core_idle,(unsigned long long)s_cmd_core_running);
 }
 
 static bool self_run_until_idle(Cx4 *c, uint64_t *master, uint32_t *chunks_out) {
@@ -535,12 +599,16 @@ void cx4bus_print_status(void) {
         firmware=cx4_firmware_loaded(s_cx4);
         locked=cx4_locked(s_cx4);
     }
-    printf("CX4STAT mode=LLE_TRANSACTIONAL_V7_1_BUSMAP armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+    printf("CX4STAT mode=SINGLE_SNAPSHOT_LLE_V8 armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+           "q_depth=%lu q_pending=%lu q_push=%llu q_pop=%llu q_drop=%llu q_peak=%lu "
            "tx_active=%u tx_jobs=%llu tx_done=%llu tx_to=%llu tx_chunks=%llu tx_busy_reads=%llu tx_early=%llu tx_locked=%llu tx_last=%02X/%02X/%lu "
            "lle_runs=%lu lle_insns=%llu lle_rdrom=%lu lle_distinct=%lu lle_range=%lu-%lu firmware=%d locked=%d master=%llu status=%02X "
-           "pio_w=%llu pio_ram=%llu pio_io=%llu cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
+           "cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X "
+           "cmd_phys=%02X cmd_core=%02X cmd00=%llu/%llu cmdAF=%llu/%llu cmdOther=%llu/%llu cmdIdle=%llu cmdRunning=%llu\n",
            s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_cx4?1u:0u,
            s_rom_slot_valid?1u:0u,(unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
+           (unsigned long)write_q_depth(),(unsigned long)__atomic_load_n(&s_start_pending,__ATOMIC_ACQUIRE),(unsigned long long)s_q_pushed,(unsigned long long)s_q_popped,
+           (unsigned long long)s_q_dropped,(unsigned long)s_q_peak,
            __atomic_load_n(&s_tx_active,__ATOMIC_ACQUIRE)?1u:0u,
            (unsigned long long)s_tx_jobs,(unsigned long long)s_tx_done,(unsigned long long)s_tx_timeout,
            (unsigned long long)s_tx_chunks,(unsigned long long)s_tx_busy_reads,
@@ -549,8 +617,12 @@ void cx4bus_print_status(void) {
            (unsigned long)runs,(unsigned long long)insns,(unsigned long)rdrom,(unsigned long)distinct,
            (unsigned long)lo,(unsigned long)hi,firmware,locked,(unsigned long long)s_virtual_master,
            __atomic_load_n(&s_status_proxy,__ATOMIC_ACQUIRE),
-           (unsigned long long)s_pio_writes,(unsigned long long)s_pio_ram_writes,(unsigned long long)s_pio_io_writes,
            (unsigned long long)s_cpu_reads,(unsigned long long)s_cpu_writes,(unsigned long long)s_driven_reads,
            (unsigned long long)s_reset_vectors,(unsigned long long)s_state_resets,
-           (unsigned long)s_last_read_addr,s_last_read_data,(unsigned long)s_last_write_addr,s_last_write_data);
+           (unsigned long)s_last_read_addr,s_last_read_data,(unsigned long)s_last_write_addr,s_last_write_data,
+           s_q_last_phys_cmd,s_q_last_core_cmd,
+           (unsigned long long)s_cmd_phys_00,(unsigned long long)s_cmd_core_00,
+           (unsigned long long)s_cmd_phys_af,(unsigned long long)s_cmd_core_af,
+           (unsigned long long)s_cmd_phys_other,(unsigned long long)s_cmd_core_other,
+           (unsigned long long)s_cmd_core_idle,(unsigned long long)s_cmd_core_running);
 }
