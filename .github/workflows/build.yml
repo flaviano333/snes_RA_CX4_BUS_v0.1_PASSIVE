@@ -1,4 +1,4 @@
-name: Build CX4 V4 PWM SYSCLK V6.3
+name: Build CX4 LLE TRANSACTIONAL V7
 
 on:
   workflow_dispatch:
@@ -22,13 +22,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi curl
-      - name: Fetch pinned CX4 core for selfcheck only
+      - name: Fetch pinned instruction-level CX4 core
         run: |
           mkdir -p third_party
           curl -fsSL https://raw.githubusercontent.com/RetroPortingToolKit/snesrecomp/bb37c87/runner/src/snes/cx4.c -o third_party/cx4.c
           curl -fsSL https://raw.githubusercontent.com/RetroPortingToolKit/snesrecomp/bb37c87/runner/src/snes/cx4.h -o third_party/cx4.h
           python3 tools/patch_upstream_cx4.py third_party/cx4.c
-          grep -q "int cx4_load_firmware" third_party/cx4.c
+          grep -q "uint8_t cx4_read" third_party/cx4.c
+          grep -q "void cx4_sync" third_party/cx4.c
+          grep -q "uint64_t cx4_instructions_executed" third_party/cx4.c
+      - name: Static architecture checks
+        run: |
+          ! grep -R "hle_conv_oam\|hle_math_command\|hle_on_command" -n cx4_active_bus.c
+          grep -q "LLE_TRANSACTIONAL_V7" cx4_active_bus.c
+          grep -q "TX_MASTER_CHUNK" cx4_active_bus.c
+          grep -q "cx4_write(s_cx4" cx4_active_bus.c
+          grep -q "cx4_sync(s_cx4" cx4_active_bus.c
       - name: Configure
         env:
           PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
@@ -36,9 +45,9 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Rename UF2
-        run: cp build/cx4_v4_pwm_sysclk_v6_3.uf2 build/CX4_V4_PWM_SYSCLK_V6_3_GENERIC.uf2
+        run: cp build/cx4_lle_transactional_v7.uf2 build/CX4_LLE_TRANSACTIONAL_V7_GENERIC_SEM_ROM.uf2
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: CX4-V4-PWM-SYSCLK-V6-3
-          path: build/CX4_V4_PWM_SYSCLK_V6_3_GENERIC.uf2
+          name: CX4-LLE-TRANSACTIONAL-V7
+          path: build/CX4_LLE_TRANSACTIONAL_V7_GENERIC_SEM_ROM.uf2

@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
@@ -11,42 +10,49 @@
 #include "cx4.h"
 
 /*
- * CX4 BOOTBACK HLE BUSY-SYNC V4
+ * CX4 LLE TRANSACTIONAL V7
  *
- * Goal: make the CPU-visible CX4 state deterministic for gameplay bring-up.
- * Runtime HG51B LLE is deliberately NOT connected to the CPU-visible C4RAM.
- * The LLE core remains available only for CX4SELF, which validates the injected
- * MMX2 ROM + HG51B core independently of the physical bus.
+ * This build deliberately abandons command-by-command HLE.  Every physical
+ * write to the Cx4 window is fed to the instruction-level HG51B core.  If that
+ * write starts internal work, Core0 advances the real core against a synthetic
+ * SNES-master-clock timeline until the Cx4 reports idle again.  While it is
+ * running, Core1 continues to answer the SNES CPU's status polls immediately.
  *
- * Persistent CPU-visible C4 state is written only by the proven PIO+DMA write
- * path. The active core1 responder only reads this state and drives D0-D7.
- * $7F4F=$00 / $7F4D=$00 executes an OAM conversion matching Snes9x C4ConvOAM.
+ * No external SYSTEM CLK and no /RESET wire are used.  The proven V4 A-bus
+ * capture/responder stays intact; only the Cx4 state engine is replaced.
  */
 
-#define PIN_PHI2 0u
-#define PIN_WR   1u
-#define PIN_RD   35u
-#define PIN_ROMSEL 38u
-#define PIN_WRAMSEL 39u
+#define PIN_PHI2     0u
+#define PIN_WR       1u
+#define PIN_RD       35u
+#define PIN_ROMSEL   38u
+#define PIN_WRAMSEL  39u
 
 #define DATA_MASK ((1u << 2) | (1u << 3) | (1u << 4) | \
                    (1u << 6) | (1u << 7) | (1u << 8) | \
                    (1u << 9) | (1u << 10))
-#define PHI2_MASK (1u << PIN_PHI2)
-#define WR_MASK   (1u << PIN_WR)
-#define RD_HI_MASK (1u << (PIN_RD - 32u))
-#define ROMSEL_HI_MASK (1u << (PIN_ROMSEL - 32u))
+#define PHI2_MASK       (1u << PIN_PHI2)
+#define WR_MASK         (1u << PIN_WR)
+#define RD_HI_MASK      (1u << (PIN_RD - 32u))
+#define ROMSEL_HI_MASK  (1u << (PIN_ROMSEL - 32u))
 #define WRAMSEL_HI_MASK (1u << (PIN_WRAMSEL - 32u))
-#define A13_MASK (1u << 25)
-#define A14_MASK (1u << 27)
-#define A15_MASK (1u << 28)
-#define A22_HI_MASK (1u << (36u - 32u))
+#define A13_MASK        (1u << 25)
+#define A14_MASK        (1u << 27)
+#define A15_MASK        (1u << 28)
+#define A22_HI_MASK     (1u << (36u - 32u))
 
 #define CX4_ROM_SLOT_FLASH_OFFSET (4u * 1024u * 1024u)
 #define CX4_ROM_SLOT_HEADER_SIZE 256u
 #define CX4_ROM_SLOT_MAX_BYTES (4u * 1024u * 1024u - CX4_ROM_SLOT_HEADER_SIZE)
 #define CX4_ROM_SLOT_MAGIC 0x52345843u
 #define CX4_ROM_SLOT_VERSION 1u
+
+/* A transaction advances the HG51B in 4096 SNES-master-cycle chunks.  This is
+ * not wall-clock timing: it is a monotonic virtual timeline used only by the
+ * upstream 20 MHz / 21.477 MHz rate converter.  4096 chunks gives a generous
+ * ~0.78 s of emulated time before declaring a wedge. */
+#define TX_MASTER_CHUNK 4096u
+#define TX_MAX_CHUNKS   4096u
 
 typedef struct {
     uint32_t magic;
@@ -59,14 +65,14 @@ static const uint8_t *s_game_rom = NULL;
 static uint32_t s_game_rom_size = 0;
 static uint32_t s_game_rom_crc32 = 0;
 static bool s_rom_slot_valid = false;
+static Cx4 *s_cx4 = NULL;
 
-/* CPU-visible 8 KiB C4 address space ($6000-$7FFF). For the real chip,
- * $7000-$7BFF mirrors 3 KiB data RAM and several IO areas have special
- * semantics. We implement the known RAM mirror and the subset required for
- * gameplay HLE; unimplemented areas read the byte last written (or zero). */
-static uint8_t s_c4ram[0x2000];
-static uint8_t s_hle_input[0x0c00];
-static uint8_t s_oam_backup[0x0220];
+/* Core1 never dereferences the Cx4 object.  It serves this byte mirror so the
+ * physical read responder remains lock-free while Core0 executes HG51B code. */
+static volatile uint8_t s_shadow[0x2000];
+static volatile uint8_t s_status_proxy = 0;
+static volatile uint8_t s_tx_active = 0;
+static uint64_t s_virtual_master = 1;
 
 static volatile bool s_armed = false;
 static volatile bool s_core1_started = false;
@@ -87,53 +93,18 @@ static volatile uint32_t s_last_write_addr = 0;
 static volatile uint8_t s_last_read_data = 0;
 static volatile uint8_t s_last_write_data = 0;
 
-static volatile uint64_t s_hle_jobs = 0;
-static volatile uint64_t s_hle_good_jobs = 0;
-static volatile uint64_t s_hle_rejected_jobs = 0;
-static volatile uint64_t s_hle_groups = 0;
-static volatile uint64_t s_hle_oam = 0;
-static volatile uint64_t s_hle_longparts = 0;
-static volatile uint64_t s_hle_zero_ptr = 0;
-static volatile uint32_t s_hle_pmax = 0;
-static volatile uint32_t s_hle_last_ptr = 0;
-static volatile uint8_t s_hle_last_sub = 0xffu;
-static volatile uint64_t s_hle_math_jobs = 0;
-static volatile uint64_t s_hle_test_jobs = 0;
-static volatile uint64_t s_hle_unhandled = 0;
+static volatile uint64_t s_tx_jobs = 0;
+static volatile uint64_t s_tx_done = 0;
+static volatile uint64_t s_tx_timeout = 0;
+static volatile uint64_t s_tx_chunks = 0;
+static volatile uint64_t s_tx_busy_reads = 0;
+static volatile uint64_t s_tx_early_arms = 0;
+static volatile uint64_t s_tx_locked = 0;
+static volatile uint8_t s_tx_last_entry = 0xffu;
+static volatile uint8_t s_tx_last_status = 0;
+static volatile uint32_t s_tx_last_chunks = 0;
 
-/* Hardware-visible command synchronization. Core1 raises BUSY as soon as it
- * sees a qualified write to $7F4F. Core0 clears BUSY only after the HLE result
- * is fully committed to s_c4ram. This mirrors the real chip's command barrier
- * and prevents the SNES CPU from reading half-written OAM/results. */
-static volatile uint8_t s_hle_busy = 0;
-static volatile uint64_t s_busy_arms = 0;
-static volatile uint64_t s_busy_clears = 0;
-static volatile uint64_t s_busy_status_reads = 0;
-static volatile uint64_t s_busy_rearms = 0;
-static volatile uint8_t s_unhandled_last_cmd = 0xffu;
-static volatile uint8_t s_unhandled_last_sub = 0xffu;
-
-static inline void hle_busy_set(void) {
-    uint8_t old = __atomic_exchange_n(&s_hle_busy, 1u, __ATOMIC_ACQ_REL);
-    if (old) s_busy_rearms++; else s_busy_arms++;
-}
-static inline void hle_busy_clear(void) {
-    if (__atomic_exchange_n(&s_hle_busy, 0u, __ATOMIC_ACQ_REL)) s_busy_clears++;
-}
-static inline bool hle_busy_get(void) {
-    return __atomic_load_n(&s_hle_busy, __ATOMIC_ACQUIRE) != 0u;
-}
-
-/* These three are invariants explicitly checked by Snes9x's C4 debugger. */
-static volatile uint64_t s_inv625_bad = 0;
-static volatile uint64_t s_inv629_bad = 0;
-static volatile uint64_t s_inv627_bad = 0;
-static volatile uint8_t s_inv_last_625 = 0;
-static volatile uint8_t s_inv_last_626 = 0;
-static volatile uint8_t s_inv_last_629 = 0;
-static volatile uint16_t s_inv_last_627 = 0;
-
-/* Tiny IO trace. */
+/* Tiny physical IO trace. */
 typedef struct { uint16_t off; uint8_t data; uint8_t op; } trace_t;
 #define TRACE_N 64u
 static volatile trace_t s_trace[TRACE_N];
@@ -202,28 +173,36 @@ static inline bool cx4_bank(uint8_t b) {
     return b <= 0x3fu || (b >= 0x80u && b <= 0xbfu);
 }
 
-static inline uint16_t ram_index_from_off(uint16_t off) {
-    return (uint16_t)(off - 0x6000u);
-}
-
-/* CPU-visible read. Match old HLE behavior for status: $7F5E is ready. */
-static inline uint8_t bus_read(uint16_t off) {
-    if (off == 0x7f5eu) {
-        if (hle_busy_get()) { s_busy_status_reads++; return 0x80u; }
-        return 0u;
-    }
+static inline uint16_t canonical_off(uint16_t off) {
     if (off >= 0x7000u && off <= 0x7bffu)
-        return s_c4ram[(off - 0x7000u) & 0x0fffu];
-    return s_c4ram[ram_index_from_off(off) & 0x1fffu];
+        return (uint16_t)(0x6000u + (off - 0x7000u));
+    if (off >= 0x7c00u && off <= 0x7fffu)
+        return (uint16_t)(0x6c00u + (off - 0x7c00u));
+    return off;
 }
 
-static inline void bus_write_raw(uint16_t off, uint8_t v) {
-    if (off >= 0x7000u && off <= 0x7bffu) {
-        uint16_t i = (uint16_t)((off - 0x7000u) & 0x0fffu);
-        if (i < 0x0c00u) s_c4ram[i] = v;
-        return;
+static inline void shadow_store(uint16_t off, uint8_t v) {
+    uint16_t c = canonical_off(off);
+    if (c < 0x6000u || c > 0x6fffu) return;
+    s_shadow[c - 0x6000u] = v;
+    if (c <= 0x6bffu)
+        s_shadow[(0x7000u + (c - 0x6000u)) - 0x6000u] = v;
+    else
+        s_shadow[(0x7c00u + (c - 0x6c00u)) - 0x6000u] = v;
+}
+
+static inline bool is_status_offset(uint16_t off) {
+    uint16_t c = canonical_off(off);
+    return c == 0x6f5eu;  /* mirror of $7F5E */
+}
+
+static inline uint8_t bus_read(uint16_t off) {
+    if (is_status_offset(off)) {
+        uint8_t v = __atomic_load_n(&s_status_proxy, __ATOMIC_ACQUIRE);
+        if (v & 0xc0u) s_tx_busy_reads++;
+        return v;
     }
-    s_c4ram[ram_index_from_off(off) & 0x1fffu] = v;
+    return s_shadow[(off - 0x6000u) & 0x1fffu];
 }
 
 static inline void trace_io(uint8_t op, uint16_t off, uint8_t data) {
@@ -232,356 +211,97 @@ static inline void trace_io(uint8_t op, uint16_t off, uint8_t data) {
     s_trace[i].off = off; s_trace[i].data = data; s_trace[i].op = op;
 }
 
-static inline uint16_t rd16(const uint8_t *p) {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-static inline uint32_t rd24(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
-}
-static inline uint32_t c4_rom_offset(uint32_t a) {
-    return ((a & 0xff0000u) >> 1) + (a & 0x7fffu);
-}
-static inline uint8_t rom8(uint32_t off) {
-    return (s_game_rom && off < s_game_rom_size) ? s_game_rom[off] : 0u;
-}
+static void mirror_refresh_all(void) {
+    if (!s_cx4) return;
 
-/* Exact gameplay OAM conversion structure from Snes9x C4ConvOAM, adapted to
- * the isolated CPU-visible RAM. We compute into live OAM but keep a backup and
- * roll back the entire OAM table when the input snapshot fails strong sanity
- * checks. This prevents one bad capture from turning a frame into garbage. */
-static bool hle_conv_oam(void) {
-    if (!s_game_rom) return false;
-
-    memcpy(s_hle_input, s_c4ram, sizeof(s_hle_input));
-    memcpy(s_oam_backup, s_c4ram, sizeof(s_oam_backup));
-
-    const uint8_t v625 = s_hle_input[0x625];
-    const uint8_t v626 = s_hle_input[0x626];
-    const uint8_t v629 = s_hle_input[0x629];
-    const uint16_t v627 = rd16(&s_hle_input[0x627]);
-    s_inv_last_625 = v625; s_inv_last_626 = v626; s_inv_last_629 = v629; s_inv_last_627 = v627;
-
-    bool inv_ok = true;
-    if (v625 != 0u) { s_inv625_bad++; inv_ok = false; }
-    if (v629 != (uint8_t)(v626 >> 2)) { s_inv629_bad++; inv_ok = false; }
-    if (v627 != (uint16_t)((uint16_t)v626 << 2)) { s_inv627_bad++; inv_ok = false; }
-
-    const uint8_t groups = s_hle_input[0x620];
-    if (groups > 128u || v626 > 127u) inv_ok = false;
-
-    s_hle_jobs++;
-    s_hle_last_sub = s_c4ram[0x1f4d];
-
-    if (!inv_ok) {
-        s_hle_rejected_jobs++;
-        return false;
+    /* 3 KiB Cx4 data RAM and its $7000 mirror. */
+    for (uint16_t i = 0; i < 0x0c00u; ++i) {
+        uint8_t *p = cx4_ram_ptr(s_cx4, (uint16_t)(0x6000u + i));
+        uint8_t v = p ? *p : 0u;
+        s_shadow[i] = v;
+        s_shadow[0x1000u + i] = v;
     }
 
-    uint16_t oam = (uint16_t)v626 << 2;
-    for (int i = 0x01fd; i > (int)oam; i -= 4) s_c4ram[i] = 0xe0u;
-
-    const int16_t global_x = (int16_t)rd16(&s_hle_input[0x621]);
-    const int16_t global_y = (int16_t)rd16(&s_hle_input[0x623]);
-    uint16_t oam2 = (uint16_t)(0x0200u + (v626 >> 2));
-    uint8_t spr_count = (uint8_t)(128u - v626);
-    uint8_t bitoff = (uint8_t)((v626 & 3u) * 2u);
-    uint16_t src = 0x0220u;
-    uint32_t emitted = 0;
-
-    for (uint16_t gi = 0; gi < groups && spr_count; ++gi, src += 16u) {
-        if (src + 15u >= sizeof(s_hle_input)) break;
-        s_hle_groups++;
-
-        int16_t sx = (int16_t)rd16(&s_hle_input[src]) - global_x;
-        int16_t sy = (int16_t)rd16(&s_hle_input[src + 2u]) - global_y;
-        uint8_t name = s_hle_input[src + 5u];
-        uint8_t attr = (uint8_t)(s_hle_input[src + 4u] | s_hle_input[src + 6u]);
-        uint32_t ptr = rd24(&s_hle_input[src + 7u]);
-        s_hle_last_ptr = ptr;
-        uint32_t rp = c4_rom_offset(ptr);
-        uint8_t parts = rom8(rp);
-        if (parts > s_hle_pmax) s_hle_pmax = parts;
-        if (rp >= s_game_rom_size) s_hle_zero_ptr++;
-
-        /* Exact Snes9x/C4 behavior: a descriptor may advertise more pieces
-         * than the remaining OAM slots. The loop below simply stops when
-         * SprCount reaches zero; this is NOT evidence of corrupt input. */
-        if (parts > spr_count) s_hle_longparts++;
-
-        if (parts) {
-            rp++;
-            for (uint16_t n = 0; n < parts && spr_count; ++n, rp += 4u) {
-                uint8_t flags = rom8(rp + 0u);
-                int16_t x = (int8_t)rom8(rp + 1u);
-                int16_t y = (int8_t)rom8(rp + 2u);
-                uint8_t td = rom8(rp + 3u);
-                bool large = (flags & 0x20u) != 0u;
-
-                if (attr & 0x40u) x = (int16_t)(-x - (large ? 16 : 8));
-                x = (int16_t)(x + sx);
-                if (x < -16 || x > 272) continue;
-                if (attr & 0x80u) y = (int16_t)(-y - (large ? 16 : 8));
-                y = (int16_t)(y + sy);
-                if (y < -16 || y > 224) continue;
-
-                s_c4ram[oam + 0u] = (uint8_t)x;
-                s_c4ram[oam + 1u] = (uint8_t)y;
-                s_c4ram[oam + 2u] = (uint8_t)(name + td);
-                s_c4ram[oam + 3u] = (uint8_t)(attr ^ (flags & 0xc0u));
-
-                uint8_t hv = s_c4ram[oam2];
-                hv &= (uint8_t)~(3u << bitoff);
-                if (x & 0x100) hv |= (uint8_t)(1u << bitoff);
-                if (large) hv |= (uint8_t)(2u << bitoff);
-                s_c4ram[oam2] = hv;
-
-                oam += 4u; spr_count--; emitted++;
-                bitoff = (uint8_t)((bitoff + 2u) & 6u);
-                if (!bitoff) oam2++;
-            }
-        } else if (spr_count) {
-            s_c4ram[oam + 0u] = (uint8_t)sx;
-            s_c4ram[oam + 1u] = (uint8_t)sy;
-            s_c4ram[oam + 2u] = name;
-            s_c4ram[oam + 3u] = attr;
-            uint8_t hv = s_c4ram[oam2];
-            hv &= (uint8_t)~(3u << bitoff);
-            hv |= (uint8_t)((sx & 0x100) ? (3u << bitoff) : (2u << bitoff));
-            s_c4ram[oam2] = hv;
-            oam += 4u; spr_count--; emitted++;
-            bitoff = (uint8_t)((bitoff + 2u) & 6u);
-            if (!bitoff) oam2++;
-        }
-    }
-
-    s_hle_good_jobs++;
-    s_hle_oam += emitted;
-    return true;
-}
-
-
-static inline void wr16(uint8_t *p, uint16_t v) {
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-}
-static inline uint32_t rd24u(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
-}
-static inline void wr24(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16);
-}
-static void hle_math_command(uint8_t cmd) {
-    const double pi = 3.14159265358979323846;
-    switch (cmd) {
-        case 0x05: { /* propulsion */
-            uint16_t den = rd16(&s_c4ram[0x1f83]);
-            uint16_t num = rd16(&s_c4ram[0x1f81]);
-            int32_t tmp = 0x10000;
-            if (den) tmp = (int32_t)(((tmp / (int32_t)den) * (int32_t)num) >> 8);
-            wr16(&s_c4ram[0x1f80], (uint16_t)tmp);
-            s_hle_math_jobs++;
-            break;
-        }
-        case 0x0d: { /* normalize vector to requested length */
-            int16_t x = (int16_t)rd16(&s_c4ram[0x1f80]);
-            int16_t y = (int16_t)rd16(&s_c4ram[0x1f83]);
-            int16_t d = (int16_t)rd16(&s_c4ram[0x1f86]);
-            double mag = sqrt((double)x*x + (double)y*y);
-            if (mag > 0.0) {
-                wr16(&s_c4ram[0x1f89], (uint16_t)(int16_t)(x * ((double)d / mag) * 0.98));
-                wr16(&s_c4ram[0x1f8c], (uint16_t)(int16_t)(y * ((double)d / mag) * 0.99));
-            } else {
-                wr16(&s_c4ram[0x1f89], 0); wr16(&s_c4ram[0x1f8c], 0);
-            }
-            s_hle_math_jobs++;
-            break;
-        }
-        case 0x10:
-        case 0x13: { /* polar -> rectangular */
-            uint16_t a = rd16(&s_c4ram[0x1f80]) & 0x1ffu;
-            int32_t r = (int16_t)rd16(&s_c4ram[0x1f83]);
-            double th = ((double)a * 2.0 * pi) / 512.0;
-            if (cmd == 0x10) {
-                int32_t x = (int32_t)lrint((double)r * cos(th));
-                int32_t y0 = (int32_t)lrint((double)r * sin(th));
-                int32_t y = y0 - (y0 >> 6);
-                wr24(&s_c4ram[0x1f86], (uint32_t)x);
-                wr24(&s_c4ram[0x1f89], (uint32_t)y);
-            } else {
-                int32_t x = (int32_t)lrint((double)r * cos(th) * 256.0);
-                int32_t y = (int32_t)lrint((double)r * sin(th) * 256.0);
-                wr24(&s_c4ram[0x1f86], (uint32_t)x);
-                wr24(&s_c4ram[0x1f89], (uint32_t)y);
-            }
-            s_hle_math_jobs++;
-            break;
-        }
-        case 0x15: { /* vector magnitude */
-            int16_t x = (int16_t)rd16(&s_c4ram[0x1f80]);
-            int16_t y = (int16_t)rd16(&s_c4ram[0x1f83]);
-            uint16_t d = (uint16_t)(int16_t)sqrt((double)x*x + (double)y*y);
-            wr16(&s_c4ram[0x1f80], d);
-            s_hle_math_jobs++;
-            break;
-        }
-        case 0x1f: { /* atan -> 9-bit angle */
-            int16_t x = (int16_t)rd16(&s_c4ram[0x1f80]);
-            int16_t y = (int16_t)rd16(&s_c4ram[0x1f83]);
-            int32_t a;
-            if (x == 0) a = (y > 0) ? 0x80 : 0x180;
-            else {
-                a = (int32_t)(atan((double)y / (double)x) / (2.0*pi) * 512.0);
-                if (x < 0) a += 0x100;
-                a &= 0x1ff;
-            }
-            wr16(&s_c4ram[0x1f86], (uint16_t)a);
-            s_hle_math_jobs++;
-            break;
-        }
-        case 0x25: { /* 24-bit multiply; low 24 bits are visible */
-            uint64_t a = rd24u(&s_c4ram[0x1f80]);
-            uint64_t b = rd24u(&s_c4ram[0x1f83]);
-            wr24(&s_c4ram[0x1f80], (uint32_t)(a*b));
-            s_hle_math_jobs++;
-            break;
-        }
-        case 0x2d: { /* transform coordinates */
-            double x = (int16_t)rd16(&s_c4ram[0x1f81]);
-            double y = (int16_t)rd16(&s_c4ram[0x1f84]);
-            double z = (int16_t)rd16(&s_c4ram[0x1f87]);
-            double ax = -(double)s_c4ram[0x1f89] * 2.0*pi / 128.0;
-            double ay = -(double)s_c4ram[0x1f8a] * 2.0*pi / 128.0;
-            double az = -(double)s_c4ram[0x1f8b] * 2.0*pi / 128.0;
-            double y2 = y*cos(ax) - z*sin(ax);
-            double z2 = y*sin(ax) + z*cos(ax);
-            double x2 = x*cos(ay) + z2*sin(ay);
-            double z3 = x*(-sin(ay)) + z2*cos(ay);
-            double xr = x2*cos(az) - y2*sin(az);
-            double yr = x2*sin(az) + y2*cos(az);
-            (void)z3;
-            double scale = (double)rd16(&s_c4ram[0x1f90]) / 256.0;
-            wr16(&s_c4ram[0x1f80], (uint16_t)(int16_t)lrint(xr*scale));
-            wr16(&s_c4ram[0x1f83], (uint16_t)(int16_t)lrint(yr*scale));
-            s_hle_math_jobs++;
-            break;
-        }
-        default:
-            s_hle_unhandled++;
-            break;
-    }
-}
-
-static void hle_on_command(uint16_t off, uint8_t data) {
-    if (off != 0x7f4fu) return;
-
-    /* Core1 normally raises BUSY at the physical write edge. Raise it here as
-     * well so replay/self-test paths and any missed early observation remain
-     * safe. BUSY is released on every command exit below. */
-    hle_busy_set();
-    s_hle_last_sub = s_c4ram[0x1f4du];
-
-    /* Legacy C4 HLE self-test behavior used by games/emulators. */
-    if (s_hle_last_sub == 0x0eu && data < 0x40u && (data & 3u) == 0u) {
-        s_c4ram[0x1f80u] = (uint8_t)(data >> 2);
-        s_hle_test_jobs++;
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        hle_busy_clear();
-        return;
-    }
-
-    /* C4 immediate/self-test command family. These are command-level results
-     * used by X2/X3 and match the established C4 HLE behavior. */
-    if (s_hle_last_sub == 0x0eu) {
-        if (data == 0x40u) { /* Sum first 0x800 C4 RAM bytes. */
-            uint16_t sum = 0;
-            for (uint32_t i = 0; i < 0x800u; ++i) sum = (uint16_t)(sum + s_c4ram[i]);
-            wr16(&s_c4ram[0x1f80u], sum);
-            s_hle_test_jobs++;
-            __atomic_thread_fence(__ATOMIC_RELEASE);
-            hle_busy_clear();
-            return;
-        }
-        if (data == 0x54u) { /* Signed 24-bit square -> 48-bit result. */
-            int32_t a = (int32_t)rd24u(&s_c4ram[0x1f80u]);
-            if (a & 0x00800000) a |= (int32_t)0xff000000;
-            uint64_t sq = (uint64_t)((int64_t)a * (int64_t)a);
-            wr24(&s_c4ram[0x1f83u], (uint32_t)(sq & 0x00ffffffu));
-            wr24(&s_c4ram[0x1f86u], (uint32_t)((sq >> 24) & 0x00ffffffu));
-            s_hle_test_jobs++;
-            __atomic_thread_fence(__ATOMIC_RELEASE);
-            hle_busy_clear();
-            return;
-        }
-        if (data == 0x5cu) { /* Immediate register test pattern. */
-            static const uint8_t pat[48] = {
-                0x00,0x00,0x00,0xff, 0xff,0xff,0x00,0xff,
-                0x00,0x00,0x00,0xff, 0xff,0xff,0x00,0x00,
-                0xff,0xff,0x00,0x00, 0x80,0xff,0xff,0x7f,
-                0x00,0x80,0x00,0xff, 0x7f,0x00,0xff,0x7f,
-                0xff,0x7f,0xff,0xff, 0x00,0x00,0x01,0xff,
-                0xff,0xfe,0x00,0x01, 0x00,0xff,0xfe,0x00
-            };
-            memcpy(&s_c4ram[0], pat, sizeof(pat));
-            s_hle_test_jobs++;
-            __atomic_thread_fence(__ATOMIC_RELEASE);
-            hle_busy_clear();
-            return;
-        }
-        if (data == 0x89u) { /* Immediate ROM signature. */
-            s_c4ram[0x1f80u] = 0x36u;
-            s_c4ram[0x1f81u] = 0x43u;
-            s_c4ram[0x1f82u] = 0x05u;
-            s_hle_test_jobs++;
-            __atomic_thread_fence(__ATOMIC_RELEASE);
-            hle_busy_clear();
-            return;
-        }
-    }
-
-    if (data == 0x00u && s_hle_last_sub == 0x00u) {
-        (void)hle_conv_oam();
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        hle_busy_clear();
-        return;
-    }
-
-    /* Low-risk arithmetic subset; complex drawing effects remain untouched. */
-    switch (data) {
-        case 0x05: case 0x0d: case 0x10: case 0x13:
-        case 0x15: case 0x1f: case 0x25: case 0x2d:
-            hle_math_command(data);
-            break;
-        default:
-            s_hle_unhandled++;
-            s_unhandled_last_cmd = data;
-            s_unhandled_last_sub = s_hle_last_sub;
-            break;
+    /* 1 KiB IO window and its $7C00 mirror.  CPU reads have no destructive
+       side effects in this core, so a snapshot is safe. */
+    for (uint16_t i = 0; i < 0x0400u; ++i) {
+        uint8_t v = cx4_read(s_cx4, (uint16_t)(0x6c00u + i));
+        s_shadow[0x0c00u + i] = v;
+        s_shadow[0x1c00u + i] = v;
     }
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    hle_busy_clear();
+    __atomic_store_n(&s_status_proxy, s_shadow[0x1f5eu], __ATOMIC_RELEASE);
+}
+
+static bool transaction_run_until_idle(void) {
+    if (!s_cx4) return false;
+
+    uint8_t st = cx4_read(s_cx4, 0x7f5eu);
+    __atomic_store_n(&s_status_proxy, st, __ATOMIC_RELEASE);
+    if ((st & 0xc0u) == 0u) return true;
+
+    __atomic_store_n(&s_tx_active, 1u, __ATOMIC_RELEASE);
+    s_tx_jobs++;
+    uint32_t chunks = 0;
+
+    for (; chunks < TX_MAX_CHUNKS; ++chunks) {
+        s_virtual_master += TX_MASTER_CHUNK;
+        cx4_sync(s_cx4, s_virtual_master);
+        s_tx_chunks++;
+        st = cx4_read(s_cx4, 0x7f5eu);
+        __atomic_store_n(&s_status_proxy, st, __ATOMIC_RELEASE);
+        if ((st & 0xc0u) == 0u) break;
+        if (cx4_locked(s_cx4)) { s_tx_locked++; break; }
+    }
+
+    s_tx_last_chunks = chunks + 1u;
+    s_tx_last_status = st;
+
+    mirror_refresh_all();
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_tx_active, 0u, __ATOMIC_RELEASE);
+
+    if ((st & 0xc0u) == 0u) {
+        s_tx_done++;
+        return true;
+    }
+    s_tx_timeout++;
+    return false;
 }
 
 static void clear_runtime_state(void) {
-    memset(s_c4ram, 0, sizeof(s_c4ram));
-    memset(s_hle_input, 0, sizeof(s_hle_input));
-    memset(s_oam_backup, 0, sizeof(s_oam_backup));
-    s_hle_jobs = s_hle_good_jobs = s_hle_rejected_jobs = 0;
-    s_hle_groups = s_hle_oam = s_hle_longparts = s_hle_zero_ptr = 0;
-    s_hle_pmax = 0; s_hle_last_ptr = 0; s_hle_last_sub = 0xffu;
-    s_hle_math_jobs = s_hle_test_jobs = s_hle_unhandled = 0;
-    __atomic_store_n(&s_hle_busy, 0u, __ATOMIC_RELEASE);
-    s_busy_arms = s_busy_clears = s_busy_status_reads = s_busy_rearms = 0;
-    s_unhandled_last_cmd = s_unhandled_last_sub = 0xffu;
-    s_inv625_bad = s_inv629_bad = s_inv627_bad = 0;
-    s_inv_last_625 = s_inv_last_626 = s_inv_last_629 = 0; s_inv_last_627 = 0;
+    memset((void *)s_shadow, 0, sizeof(s_shadow));
+    s_virtual_master = 1;
+    __atomic_store_n(&s_tx_active, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_status_proxy, 0u, __ATOMIC_RELEASE);
+    s_tx_jobs = s_tx_done = s_tx_timeout = s_tx_chunks = 0;
+    s_tx_busy_reads = s_tx_early_arms = s_tx_locked = 0;
+    s_tx_last_entry = 0xffu;
+    s_tx_last_status = 0;
+    s_tx_last_chunks = 0;
     s_trace_seq = 0;
+    if (s_cx4) {
+        cx4_reset(s_cx4);
+        mirror_refresh_all();
+    }
     s_state_resets++;
 }
 
 void cx4bus_init(void) {
     rom_slot_probe();
+    s_armed = false;
+    s_driving = false;
+    s_reset_requested = false;
+
+    if (s_rom_slot_valid) {
+        s_cx4 = cx4_create(s_game_rom, s_game_rom_size, NULL, 0);
+        if (s_cx4) cx4_synthesize_data_rom(s_cx4);
+    }
+
     clear_runtime_state();
-    s_armed = s_rom_slot_valid; s_driving = false; s_reset_requested = false;
+    s_armed = s_rom_slot_valid && s_cx4 && cx4_firmware_loaded(s_cx4);
+
     const uint pins[8] = {2,3,4,6,7,8,9,10};
     for (unsigned i=0;i<8;i++) {
         gpio_set_function(pins[i], GPIO_FUNC_SIO);
@@ -592,7 +312,7 @@ void cx4bus_init(void) {
 }
 
 void cx4bus_arm(bool enabled) {
-    s_armed = enabled && s_rom_slot_valid;
+    s_armed = enabled && s_rom_slot_valid && s_cx4;
     if (!s_armed) data_release();
 }
 bool cx4bus_is_armed(void) { return s_armed; }
@@ -638,11 +358,18 @@ static void __not_in_flash_func(core1_loop)(void) {
             const bool ctrl_ok_w =
                 ((hi & ROMSEL_HI_MASK) != 0u) &&
                 ((hi & WRAMSEL_HI_MASK) != 0u);
-            if (ctrl_ok_w && off == 0x7f4fu) hle_busy_set();
+
+            /* PIO+DMA remains authoritative for the byte itself, but this early
+               arm closes the race between the physical $7F4F write and Core0
+               seeing that sample. */
+            if (ctrl_ok_w && off == 0x7f4fu) {
+                __atomic_store_n(&s_status_proxy, 0xc0u, __ATOMIC_RELEASE);
+                s_tx_early_arms++;
+            }
+
             __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
             uint8_t v = raw_data(sio_hw->gpio_in);
             while (sio_hw->gpio_in & PHI2_MASK) tight_loop_contents();
-            /* Diagnostic only: persistent state is PIO+DMA-authoritative. */
             s_cpu_writes++; s_last_write_addr = off; s_last_write_data = v;
             trace_io('W', off, v);
             continue;
@@ -661,14 +388,29 @@ void cx4bus_pio_write(uint32_t address, uint8_t data) {
     uint8_t bank = (uint8_t)(address >> 16);
     uint16_t off = (uint16_t)address;
     if (!cx4_bank(bank) || off < 0x6000u || off > 0x7fffu) return;
+    if (!s_cx4) return;
 
-    bus_write_raw(off, data);
     s_pio_writes++;
-    if ((off >= 0x6000u && off <= 0x6bffu) || (off >= 0x7000u && off <= 0x7bffu))
-        s_pio_ram_writes++;
+    uint16_t c = canonical_off(off);
+    if (c >= 0x6000u && c <= 0x6bffu) s_pio_ram_writes++;
     else s_pio_io_writes++;
 
-    hle_on_command(off, data);
+    /* Keep the CPU-visible mirror immediately coherent with the write, then
+       feed the exact same write into the instruction-level core. */
+    shadow_store(off, data);
+    cx4_write(s_cx4, off, data);
+
+    if (off == 0x7f4fu || off == 0x6f4fu) s_tx_last_entry = data;
+
+    /* Any write may legally start cache fill, DMA, or program execution.
+       Inspect the real status rather than maintaining a list of pseudo commands. */
+    uint8_t st = cx4_read(s_cx4, 0x7f5eu);
+    __atomic_store_n(&s_status_proxy, st, __ATOMIC_RELEASE);
+    if (st & 0xc0u) (void)transaction_run_until_idle();
+    else if (c >= 0x6c00u) {
+        /* IO register read-back can differ from the raw byte written. */
+        shadow_store(c, cx4_read(s_cx4, c));
+    }
 }
 
 void cx4bus_service(void) {
@@ -688,52 +430,91 @@ void cx4bus_print_trace(void) {
 }
 
 void cx4bus_print_runs(void) {
-    printf("CX4RUNS runtime_lle=0 (use CX4SELF for LLE validation)\n");
+    if (!s_cx4) { printf("CX4RUNS core=0\n"); return; }
+    Cx4RunEvent ring[16];
+    uint32_t n = cx4_run_ring_copy(s_cx4, ring, 16u);
+    printf("CX4RUNS total=%lu showing=%lu\n",
+           (unsigned long)cx4_run_ring_count(s_cx4), (unsigned long)n);
+    for (uint32_t i=0;i<n;i++)
+        printf("  seq=%lu base=%06lX pb=%04X pc=%02X\n",
+               (unsigned long)ring[i].seq, (unsigned long)ring[i].base,
+               ring[i].pb, ring[i].pc);
 }
 
-static void self_sync_until_idle(Cx4 *c, uint64_t *clk) {
-    for (unsigned n=0;n<8192u;n++) {
-        if ((cx4_read(c,0x7f5eu)&0xc0u)==0u) return;
-        *clk += 4096u; cx4_sync(c,*clk);
+static bool self_run_until_idle(Cx4 *c, uint64_t *master, uint32_t *chunks_out) {
+    uint32_t chunks = 0;
+    for (; chunks < TX_MAX_CHUNKS; ++chunks) {
+        uint8_t st = cx4_read(c, 0x7f5eu);
+        if ((st & 0xc0u) == 0u) break;
+        *master += TX_MASTER_CHUNK;
+        cx4_sync(c, *master);
+        if (cx4_locked(c)) break;
     }
+    if (chunks_out) *chunks_out = chunks;
+    return (cx4_read(c,0x7f5eu) & 0xc0u) == 0u;
 }
 
 void cx4bus_selfcheck(void) {
     if (s_armed) { printf("CX4SELF REFUSED armed=1; use CX4DISARM first\n"); return; }
     if (!s_rom_slot_valid) { printf("CX4SELF FAIL rom_slot=0\n"); return; }
-    Cx4 *t=cx4_create(s_game_rom,s_game_rom_size,NULL,0);
+    Cx4 *t = cx4_create(s_game_rom, s_game_rom_size, NULL, 0);
     if (!t) { printf("CX4SELF FAIL alloc\n"); return; }
     cx4_synthesize_data_rom(t);
-    uint64_t clk=1;
-    cx4_write(t,0x7f49u,0x00u); cx4_write(t,0x7f4au,0x80u); cx4_write(t,0x7f4bu,0x02u);
-    cx4_write(t,0x7f4du,0x0eu); cx4_write(t,0x7f4eu,0x00u); cx4_write(t,0x7f48u,0x01u);
-    self_sync_until_idle(t,&clk);
-    cx4_write(t,0x7f4fu,0x5cu); self_sync_until_idle(t,&clk);
-    cx4_write(t,0x7f4fu,0x89u); self_sync_until_idle(t,&clk);
-    uint32_t lo=0,hi=0; cx4_rdrom_index_range(t,&lo,&hi);
-    printf("CX4SELF runs=%lu insns=%llu rdrom=%lu distinct=%lu range=%lu-%lu firmware=%d locked=%d status=%02X\n",
-        (unsigned long)cx4_run_ring_count(t),(unsigned long long)cx4_instructions_executed(t),
-        (unsigned long)cx4_rdrom_hits(t),(unsigned long)cx4_rdrom_distinct(t),(unsigned long)lo,(unsigned long)hi,
-        cx4_firmware_loaded(t),cx4_locked(t),cx4_read(t,0x7f5eu));
-    Cx4RunEvent ring[4]; uint32_t n=cx4_run_ring_copy(t,ring,4u);
-    for(uint32_t i=0;i<n;i++) printf("  self run seq=%lu base=%06lX pb=%04X pc=%02X\n",
-        (unsigned long)ring[i].seq,(unsigned long)ring[i].base,ring[i].pb,ring[i].pc);
+
+    uint64_t master = 1;
+    uint32_t chunks = 0, total_chunks = 0;
+    /* Same entry setup used by the earlier independent validator. */
+    cx4_write(t,0x7f49u,0x00u);
+    cx4_write(t,0x7f4au,0x80u);
+    cx4_write(t,0x7f4bu,0x02u);
+    cx4_write(t,0x7f4du,0x0eu);
+    cx4_write(t,0x7f4eu,0x00u);
+    cx4_write(t,0x7f48u,0x01u);
+    (void)self_run_until_idle(t,&master,&chunks); total_chunks += chunks;
+    cx4_write(t,0x7f4fu,0x5cu);
+    (void)self_run_until_idle(t,&master,&chunks); total_chunks += chunks;
+    cx4_write(t,0x7f4fu,0x89u);
+    bool ok = self_run_until_idle(t,&master,&chunks); total_chunks += chunks;
+
+    uint32_t lo=0,hi=0;
+    cx4_rdrom_index_range(t,&lo,&hi);
+    printf("CX4SELF ok=%u runs=%lu insns=%llu rdrom=%lu distinct=%lu range=%lu-%lu firmware=%d locked=%d status=%02X chunks=%lu\n",
+        ok?1u:0u, (unsigned long)cx4_run_ring_count(t),
+        (unsigned long long)cx4_instructions_executed(t),
+        (unsigned long)cx4_rdrom_hits(t),(unsigned long)cx4_rdrom_distinct(t),
+        (unsigned long)lo,(unsigned long)hi,cx4_firmware_loaded(t),cx4_locked(t),
+        cx4_read(t,0x7f5eu),(unsigned long)total_chunks);
     cx4_destroy(t);
 }
 
 void cx4bus_print_status(void) {
-    printf("CX4STAT mode=BOOTBACK_HLE_BUSY_SYNC_V4 armed=%u drive=%s core1=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX runtime_lle=0 "
-           "hle_jobs=%llu hle_good=%llu hle_reject=%llu hle_groups=%llu hle_oam=%llu hle_math=%llu hle_test=%llu hle_unhandled=%llu hle_pmax=%lu hle_longparts=%llu hle_zptr=%llu hle_ptr=%06lX hle_sub=%02X busy=%u busy_arm=%llu busy_clear=%llu busy_reads=%llu busy_rearm=%llu unh_last=%02X/%02X "
-           "inv625_bad=%llu inv629_bad=%llu inv627_bad=%llu inv_last=%02X/%02X/%02X/%04X "
+    uint32_t lo=0,hi=0;
+    uint32_t runs=0, rdrom=0, distinct=0;
+    uint64_t insns=0;
+    int firmware=0, locked=0;
+    if (s_cx4) {
+        cx4_rdrom_index_range(s_cx4,&lo,&hi);
+        runs=cx4_run_ring_count(s_cx4);
+        insns=cx4_instructions_executed(s_cx4);
+        rdrom=cx4_rdrom_hits(s_cx4);
+        distinct=cx4_rdrom_distinct(s_cx4);
+        firmware=cx4_firmware_loaded(s_cx4);
+        locked=cx4_locked(s_cx4);
+    }
+    printf("CX4STAT mode=LLE_TRANSACTIONAL_V7 armed=%u drive=%s core1=%u core=%u rom_slot=%u rom_bytes=%lu rom_crc=%08lX "
+           "tx_active=%u tx_jobs=%llu tx_done=%llu tx_to=%llu tx_chunks=%llu tx_busy_reads=%llu tx_early=%llu tx_locked=%llu tx_last=%02X/%02X/%lu "
+           "lle_runs=%lu lle_insns=%llu lle_rdrom=%lu lle_distinct=%lu lle_range=%lu-%lu firmware=%d locked=%d master=%llu status=%02X "
            "pio_w=%llu pio_ram=%llu pio_io=%llu cpu_r=%llu cpu_w=%llu driven=%llu vec_resets=%llu state_resets=%llu last_r=%04lX:%02X last_w=%04lX:%02X\n",
-           s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_rom_slot_valid?1u:0u,
-           (unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
-           (unsigned long long)s_hle_jobs,(unsigned long long)s_hle_good_jobs,(unsigned long long)s_hle_rejected_jobs,
-           (unsigned long long)s_hle_groups,(unsigned long long)s_hle_oam,(unsigned long long)s_hle_math_jobs,(unsigned long long)s_hle_test_jobs,(unsigned long long)s_hle_unhandled,(unsigned long)s_hle_pmax,
-           (unsigned long long)s_hle_longparts,(unsigned long long)s_hle_zero_ptr,(unsigned long)s_hle_last_ptr,s_hle_last_sub,
-           hle_busy_get()?1u:0u,(unsigned long long)s_busy_arms,(unsigned long long)s_busy_clears,(unsigned long long)s_busy_status_reads,(unsigned long long)s_busy_rearms,s_unhandled_last_cmd,s_unhandled_last_sub,
-           (unsigned long long)s_inv625_bad,(unsigned long long)s_inv629_bad,(unsigned long long)s_inv627_bad,
-           s_inv_last_625,s_inv_last_626,s_inv_last_629,s_inv_last_627,
+           s_armed?1u:0u,s_driving?"ON":"OFF",s_core1_started?1u:0u,s_cx4?1u:0u,
+           s_rom_slot_valid?1u:0u,(unsigned long)s_game_rom_size,(unsigned long)s_game_rom_crc32,
+           __atomic_load_n(&s_tx_active,__ATOMIC_ACQUIRE)?1u:0u,
+           (unsigned long long)s_tx_jobs,(unsigned long long)s_tx_done,(unsigned long long)s_tx_timeout,
+           (unsigned long long)s_tx_chunks,(unsigned long long)s_tx_busy_reads,
+           (unsigned long long)s_tx_early_arms,(unsigned long long)s_tx_locked,
+           s_tx_last_entry,s_tx_last_status,(unsigned long)s_tx_last_chunks,
+           (unsigned long)runs,(unsigned long long)insns,(unsigned long)rdrom,(unsigned long)distinct,
+           (unsigned long)lo,(unsigned long)hi,firmware,locked,(unsigned long long)s_virtual_master,
+           __atomic_load_n(&s_status_proxy,__ATOMIC_ACQUIRE),
            (unsigned long long)s_pio_writes,(unsigned long long)s_pio_ram_writes,(unsigned long long)s_pio_io_writes,
            (unsigned long long)s_cpu_reads,(unsigned long long)s_cpu_writes,(unsigned long long)s_driven_reads,
            (unsigned long long)s_reset_vectors,(unsigned long long)s_state_resets,

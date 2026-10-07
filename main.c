@@ -8,8 +8,6 @@
 #include "hardware/clocks.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
-#include "hardware/pwm.h"
-#include "hardware/irq.h"
 #include "hardware/gpio.h"
 
 #include "capture_low.pio.h"
@@ -25,7 +23,6 @@
 #define PIN_WRAMSEL    39u
 
 #define SAMPLE_COUNT 1024u
-#define PIN_MASTER_CLK 41u
 #define GAMEPLAY_CLOCK_KHZ 150000u
 
 static uint32_t low_samples[2][SAMPLE_COUNT];
@@ -39,33 +36,8 @@ static uint64_t write_pairs_qualified = 0;
 static uint64_t write_pairs_rejected_ctrl = 0;
 static uint64_t dma_rearms = 0;
 
-static volatile uint64_t master_clk_wraps = 0;
-static uint master_pwm_slice = 0;
-static bool master_pwm_ready = false;
-
 static char cmd_buf[96];
 static size_t cmd_len = 0;
-
-
-static void __not_in_flash_func(master_pwm_irq)(void) {
-    if (!master_pwm_ready) return;
-    if (pwm_get_irq_status_mask() & (1u << master_pwm_slice)) {
-        pwm_clear_irq(master_pwm_slice);
-        master_clk_wraps += 65536ull;
-    }
-}
-
-static uint64_t master_clock_ticks(void) {
-    if (!master_pwm_ready) return 0;
-    uint64_t a, b;
-    uint16_t c;
-    do {
-        a = master_clk_wraps;
-        c = pwm_get_counter(master_pwm_slice);
-        b = master_clk_wraps;
-    } while (a != b);
-    return a + (uint64_t)c;
-}
 
 static inline uint32_t dma_remaining(uint channel) {
     return dma_channel_hw_addr(channel)->transfer_count & 0x0fffffffu;
@@ -155,14 +127,13 @@ static void strtoupper_inplace(char *s) {
 }
 
 static void command_info(void) {
-    printf("LASTBUS clock_khz=%u write_pairs=%llu qualified=%llu rejected_ctrl=%llu rearms=%llu active_buf=%u scan=%lu/%u sysclk_master=%llu sysclk_pwm=%u\n",
+    printf("LASTBUS clock_khz=%u write_pairs=%llu qualified=%llu rejected_ctrl=%llu rearms=%llu active_buf=%u scan=%lu/%u\n",
            GAMEPLAY_CLOCK_KHZ,
            (unsigned long long)write_pairs_seen,
            (unsigned long long)write_pairs_qualified,
            (unsigned long long)write_pairs_rejected_ctrl,
            (unsigned long long)dma_rearms,
-           active_buf, (unsigned long)scan_pos[active_buf], SAMPLE_COUNT,
-           (unsigned long long)master_clock_ticks(), master_pwm_ready ? 1u : 0u);
+           active_buf, (unsigned long)scan_pos[active_buf], SAMPLE_COUNT);
     cx4bus_print_status();
 }
 
@@ -205,39 +176,16 @@ int main(void) {
     stdio_init_all();
     sleep_ms(350);
 
-    printf("\n=== SNES RP2350B CX4 V4 + PWM SYSCLK V6.3 ===\n");
-    printf("clock=%u kHz | V4 gameplay path unchanged + passive SYSTEM CLK via PWM\n", GAMEPLAY_CLOCK_KHZ);
-    printf("pinout unchanged; GP41=SYSTEM CLK passive counter; GP42 unused/disconnected\n");
+    printf("\n=== SNES RP2350B CX4 LLE TRANSACTIONAL V7 ===\n");
+    printf("clock=%u kHz | V4 physical bus + instruction-level HG51B transactional engine\n", GAMEPLAY_CLOCK_KHZ);
+    printf("pinout unchanged: PHI2=GP0 /WR=GP1 D0-2=GP2-4 GP5=SKIP D3-7=GP6-10 /RD=GP35 /ROMSEL=GP38 /WRAMSEL=GP39 A10=GP40\n");
     printf("write authority: PIO+DMA, qualified by /ROMSEL HIGH + /WRAMSEL HIGH\n");
     printf("read responder: preserved v0.5 PHI2 timing + /ROMSEL HIGH + /WRAMSEL HIGH + /WR HIGH\n");
-    printf("CX4 response auto-arms; runtime LLE disabled; V4 HLE/BUSY path unchanged.\n\n");
+    printf("CX4 response auto-arms; HLE removed; HG51B LLE runs transactions on a synthetic master timeline.\n\n");
     fflush(stdout);
 
     for (uint pin=0; pin<=40u; ++pin) {
         configure_input(pin, pin==PIN_WR || pin==PIN_RD || pin==PIN_ROMSEL || pin==PIN_WRAMSEL);
-    }
-
-    /* Count the real SNES SYSTEM CLK without consuming any PIO state machine or DMA.
-       GP41 is an odd GPIO, therefore PWM channel B. In B-rising mode the PWM
-       counter increments once per external rising edge. */
-    gpio_init(PIN_MASTER_CLK);
-    gpio_disable_pulls(PIN_MASTER_CLK);
-    gpio_set_function(PIN_MASTER_CLK, GPIO_FUNC_PWM);
-    master_pwm_slice = pwm_gpio_to_slice_num(PIN_MASTER_CLK);
-    if (pwm_gpio_to_channel(PIN_MASTER_CLK) == PWM_CHAN_B) {
-        pwm_config mcfg = pwm_get_default_config();
-        pwm_config_set_clkdiv_mode(&mcfg, PWM_DIV_B_RISING);
-        pwm_config_set_wrap(&mcfg, 0xffffu);
-        pwm_init(master_pwm_slice, &mcfg, false);
-        pwm_clear_irq(master_pwm_slice);
-        pwm_set_irq_enabled(master_pwm_slice, true);
-        irq_set_exclusive_handler(PWM_DEFAULT_IRQ_NUM(), master_pwm_irq);
-        irq_set_enabled(PWM_DEFAULT_IRQ_NUM(), true);
-        master_clk_wraps = 0;
-        master_pwm_ready = true;
-        pwm_set_enabled(master_pwm_slice, true);
-    } else {
-        master_pwm_ready = false;
     }
 
     PIO pio_lo = pio0;
@@ -306,7 +254,7 @@ int main(void) {
     pio_sm_set_enabled(pio_lo,sm_lo,true);
 
     cx4bus_launch_core1();
-    printf("READY V4+PWM-SYSCLK V6.3. GP42 disconnected. Power/reset the SNES with Mega Man X2 selected.\n");
+    printf("READY LLE TRANSACTIONAL V7. GP41/GP42 are unused; power/reset SNES with Mega Man X2 selected.\n");
     fflush(stdout);
 
     for (;;) {
